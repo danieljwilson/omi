@@ -37,7 +37,9 @@ jobs:
 
       - name: Prepare config
         working-directory: omi-repo/omi/firmware/omi
-        run: cp omi.conf prj.conf
+        run: |
+          cp omi.conf prj.conf
+          echo "CONFIG_SPI_NOR=n" >> prj.conf
 
       - name: Build firmware
         working-directory: ncs
