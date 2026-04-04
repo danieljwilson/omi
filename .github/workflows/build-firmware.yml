@@ -5,6 +5,7 @@ on:
     branches: [led-control]
     paths:
       - 'omi/firmware/**'
+      - '.github/workflows/build-firmware.yml'
   workflow_dispatch:
 
 jobs:
@@ -22,17 +23,24 @@ jobs:
       - name: Install west
         run: pip3 install west
 
-      - name: Checkout
+      - name: Checkout OMI repo
         uses: actions/checkout@v4
+        with:
+          path: omi-repo
 
-      - name: Initialize west workspace
-        run: west init -l omi/firmware/omi
+      - name: Initialize NCS workspace
+        run: |
+          mkdir -p ncs
+          cd ncs
+          west init -m https://github.com/nrfconnect/sdk-nrf --mr v2.9.0
 
       - name: West update
+        working-directory: ncs
         run: west update --narrow -o=--depth=1
         timeout-minutes: 30
 
       - name: Install Python requirements
+        working-directory: ncs
         run: |
           pip3 install -r zephyr/scripts/requirements.txt
           pip3 install -r nrf/scripts/requirements.txt
@@ -45,16 +53,19 @@ jobs:
           echo "ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk-0.16.8" >> $GITHUB_ENV
 
       - name: Prepare config
-        working-directory: omi/firmware/omi
+        working-directory: omi-repo/omi/firmware/omi
         run: cp omi.conf prj.conf
 
       - name: Build firmware
+        working-directory: ncs
         run: |
-          west build -b omi/nrf5340/cpuapp omi/firmware/omi --sysbuild -- -DBOARD_ROOT=${{ github.workspace }}/omi/firmware
+          west build -b omi/nrf5340/cpuapp ${{ github.workspace }}/omi-repo/omi/firmware/omi \
+            --sysbuild \
+            -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware
 
       - name: Upload DFU package
         uses: actions/upload-artifact@v4
         with:
           name: omi-firmware-dfu
-          path: build/dfu_application.zip
+          path: ncs/build/dfu_application.zip
           if-no-files-found: error
