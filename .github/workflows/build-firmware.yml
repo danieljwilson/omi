@@ -35,11 +35,18 @@ jobs:
         run: nrfutil toolchain-manager launch --ncs-version v2.9.0 -- west update --narrow -o=--depth=1
         timeout-minutes: 30
 
-      - name: Prepare config
+      - name: Prepare config and overlay
         working-directory: omi-repo/omi/firmware/omi
         run: |
           cp omi.conf prj.conf
-          echo "CONFIG_SPI_NOR=n" >> prj.conf
+          # Disable SPI NOR in device tree (QSPI NOR is the actual flash)
+          cat > ci.overlay << 'EOF'
+          &spi2 {
+            spi_flash: p25q16h@1 {
+              status = "disabled";
+            };
+          };
+          EOF
 
       - name: Build firmware
         working-directory: ncs
@@ -47,7 +54,8 @@ jobs:
           nrfutil toolchain-manager launch --ncs-version v2.9.0 -- \
             west build -b omi/nrf5340/cpuapp ${{ github.workspace }}/omi-repo/omi/firmware/omi \
               --sysbuild \
-              -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware
+              -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware \
+                 -DDTC_OVERLAY_FILE=${{ github.workspace }}/omi-repo/omi/firmware/omi/ci.overlay
         timeout-minutes: 15
 
       - name: Upload DFU package
