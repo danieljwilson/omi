@@ -20,9 +20,10 @@ jobs:
           nrfutil install toolchain-manager
           nrfutil toolchain-manager install --ncs-version v2.9.0
 
-      - name: Checkout OMI repo
+      - name: Checkout OMI repo (upstream, unmodified)
         uses: actions/checkout@v4
         with:
+          repository: BasedHardware/omi
           path: omi-repo
 
       - name: Initialize NCS workspace
@@ -37,33 +38,15 @@ jobs:
 
       - name: Prepare config
         working-directory: omi-repo/omi/firmware/omi
-        run: |
-          cp omi.conf prj.conf
-          # Fix: SPI NOR driver fails to link because the spi3 controller
-          # device ordinal is not resolved. Disable SPI NOR in both Kconfig
-          # and device tree.
-          echo "CONFIG_SPI_NOR=n" >> prj.conf
-          cat > ci.overlay << 'OVERLAY'
-          / {
-            chosen {
-              /delete-property/ nordic,pm-ext-flash;
-            };
-          };
-          &spi3 {
-            p25q16h@1 {
-              status = "disabled";
-            };
-          };
-          OVERLAY
+        run: cp omi.conf prj.conf
 
-      - name: Build firmware
+      - name: Build firmware (unmodified upstream)
         working-directory: ncs
         run: |
           nrfutil toolchain-manager launch --ncs-version v2.9.0 -- \
             west build -b omi/nrf5340/cpuapp ${{ github.workspace }}/omi-repo/omi/firmware/omi \
               --sysbuild \
-              -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware \
-                 -DDTC_OVERLAY_FILE=${{ github.workspace }}/omi-repo/omi/firmware/omi/ci.overlay
+              -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware
         timeout-minutes: 15
 
       - name: Upload DFU package
