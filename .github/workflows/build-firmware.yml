@@ -1,0 +1,37 @@
+name: Build OMI Firmware
+
+on:
+  push:
+    branches: [led-control]
+    paths:
+      - 'omi/firmware/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v2.9.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize west workspace
+        run: |
+          west init -l omi/firmware/omi
+          west update --narrow -o=--depth=1
+
+      - name: Prepare config
+        working-directory: omi/firmware/omi
+        run: cp omi.conf prj.conf
+
+      - name: Build firmware
+        run: |
+          west build -b omi/nrf5340/cpuapp omi/firmware/omi --sysbuild -- -DBOARD_ROOT=${{ github.workspace }}/omi/firmware
+
+      - name: Upload DFU package
+        uses: actions/upload-artifact@v4
+        with:
+          name: omi-firmware-dfu
+          path: build/dfu_application.zip
+          if-no-files-found: error
