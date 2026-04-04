@@ -166,7 +166,7 @@ static struct bt_gatt_attr audio_service_attr[] = {
 #endif
 
     BT_GATT_CHARACTERISTIC(&audio_characteristic_led_uuid.uuid,
-                           BT_GATT_CHRC_WRITE_WITHOUT_RSP,
+                           BT_GATT_CHRC_WRITE_WITHOUT_RESP,
                            BT_GATT_PERM_WRITE,
                            NULL, led_control_write_handler, NULL),
 
