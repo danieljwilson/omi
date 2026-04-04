@@ -23,6 +23,7 @@
 #include "button.h"
 #include "config.h"
 #include "features.h"
+#include "led.h"
 #include "haptic.h"
 #include "mic.h"
 #ifdef CONFIG_OMI_ENABLE_MONITOR
@@ -45,6 +46,7 @@ static bool storage_full_warned = false;
 #endif
 
 extern bool is_connected;
+extern bool led_app_override;
 static atomic_t pusher_stop_flag;
 
 struct bt_conn *current_connection = NULL;
@@ -58,6 +60,12 @@ static ssize_t audio_data_write_handler(struct bt_conn *conn,
                                         uint16_t offset,
                                         uint8_t flags);
 
+static ssize_t led_control_write_handler(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         const void *buf,
+                                         uint16_t len,
+                                         uint16_t offset,
+                                         uint8_t flags);
 static struct bt_conn_cb _callback_references;
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
 static ssize_t audio_data_read_characteristic(struct bt_conn *conn,
@@ -129,6 +137,8 @@ static struct bt_uuid_128 audio_characteristic_format_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10002, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 static struct bt_uuid_128 audio_characteristic_speaker_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10003, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 audio_characteristic_led_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10006, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 
 static struct bt_gatt_attr audio_service_attr[] = {
     BT_GATT_PRIMARY_SERVICE(&audio_service_uuid),
@@ -154,6 +164,11 @@ static struct bt_gatt_attr audio_service_attr[] = {
                            NULL),
     BT_GATT_CCC(audio_ccc_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), //
 #endif
+
+    BT_GATT_CHARACTERISTIC(&audio_characteristic_led_uuid.uuid,
+                           BT_GATT_CHRC_WRITE_WITHOUT_RSP,
+                           BT_GATT_PERM_WRITE,
+                           NULL, led_control_write_handler, NULL),
 
 };
 
@@ -601,12 +616,47 @@ K_SEM_DEFINE(audio_tx_sem,
              CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS,
              CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS);
 
+// --- LED control characteristic write handler ---
+// App writes 0x00 = blue (idle), 0x01 = green (recording)
+static ssize_t led_control_write_handler(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         const void *buf,
+                                         uint16_t len,
+                                         uint16_t offset,
+                                         uint8_t flags)
+{
+    if (len < 1) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
+
+    uint8_t color = ((const uint8_t *)buf)[0];
+    led_app_override = true;
+
+    switch (color) {
+    case 0x00: // Blue - connected, idle
+        set_led_red(false);
+        set_led_green(false);
+        set_led_blue(true);
+        break;
+    case 0x01: // Green - recording
+        set_led_red(false);
+        set_led_green(true);
+        set_led_blue(false);
+        break;
+    default:
+        break;
+    }
+
+    return len;
+}
+
 static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 {
     k_work_cancel_delayable(&mtu_recheck_work);
     mtu_recheck_attempts = 0;
 
     is_connected = false;
+    led_app_override = false;
 
     if (IS_ENABLED(CONFIG_SHELL_BT_NUS)) {
         shell_bt_nus_disable();
