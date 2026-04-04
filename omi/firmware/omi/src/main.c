@@ -36,6 +36,7 @@ extern uint8_t battery_percentage;
 bool is_connected = false;
 bool is_charging = false;
 bool is_off = false;
+bool led_app_override = false;
 bool blink_toggle = false;
 
 static void print_reset_reason(void)
@@ -132,6 +133,12 @@ void set_led_state()
     // If device is off, turn off all LEDs immediately
     if (is_off) {
         led_off();
+        return;
+    }
+
+    // If app has taken control of LED, don't override
+    if (led_app_override) {
+        blink_toggle = !blink_toggle;
         return;
     }
 
