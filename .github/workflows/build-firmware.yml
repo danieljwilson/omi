@@ -35,18 +35,26 @@ jobs:
         run: nrfutil toolchain-manager launch --ncs-version v2.9.0 -- west update --narrow -o=--depth=1
         timeout-minutes: 30
 
-      - name: Prepare config and overlay
+      - name: Prepare config
         working-directory: omi-repo/omi/firmware/omi
         run: |
           cp omi.conf prj.conf
-          # Disable SPI NOR in device tree (QSPI NOR is the actual flash)
-          cat > ci.overlay << 'EOF'
-          &spi2 {
-            spi_flash: p25q16h@1 {
+          # Fix: SPI NOR driver fails to link because the spi3 controller
+          # device ordinal is not resolved. Disable SPI NOR in both Kconfig
+          # and device tree.
+          echo "CONFIG_SPI_NOR=n" >> prj.conf
+          cat > ci.overlay << 'OVERLAY'
+          / {
+            chosen {
+              /delete-property/ nordic,pm-ext-flash;
+            };
+          };
+          &spi3 {
+            p25q16h@1 {
               status = "disabled";
             };
           };
-          EOF
+          OVERLAY
 
       - name: Build firmware
         working-directory: ncs
