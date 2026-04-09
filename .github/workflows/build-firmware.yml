@@ -40,11 +40,9 @@ jobs:
         working-directory: omi-repo/omi/firmware/omi
         run: |
           cp omi.conf prj.conf
-          # Remove Kconfig symbols not present in NCS v2.7.0
-          # MCUBOOT_NRF53_MULTI_IMAGE_UPDATE was added after v2.7.0
-          # Our changes are app-core only, so single-image OTA is sufficient
-          sed -i 's/^SB_CONFIG_MCUBOOT_NRF53_MULTI_IMAGE_UPDATE=y/# SB_CONFIG_MCUBOOT_NRF53_MULTI_IMAGE_UPDATE=y  # not in v2.7.0/' sysbuild.conf
-          sed -i 's/^SB_CONFIG_MCUBOOT_UPDATEABLE_IMAGES=2/SB_CONFIG_MCUBOOT_UPDATEABLE_IMAGES=1/' sysbuild.conf
+          # MCUBOOT_NRF53_MULTI_IMAGE_UPDATE doesn't exist in NCS v2.7.0
+          # Comment it out — UPDATEABLE_IMAGES=2 still enables dual-core update
+          sed -i '/^SB_CONFIG_MCUBOOT_NRF53_MULTI_IMAGE_UPDATE/d' sysbuild.conf
           echo "--- sysbuild.conf after patching ---"
           cat sysbuild.conf
 
