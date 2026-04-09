@@ -18,7 +18,7 @@ jobs:
           chmod +x nrfutil
           sudo mv nrfutil /usr/local/bin/
           nrfutil install toolchain-manager
-          nrfutil toolchain-manager install --ncs-version v2.7.0
+          nrfutil toolchain-manager install --ncs-version v2.9.0
 
       - name: Checkout OMI repo (upstream, unmodified)
         uses: actions/checkout@v4
@@ -29,27 +29,50 @@ jobs:
       - name: Initialize NCS workspace
         run: |
           mkdir -p ncs && cd ncs
-          nrfutil toolchain-manager launch --ncs-version v2.7.0 -- west init -m https://github.com/nrfconnect/sdk-nrf --mr v2.7.0
+          nrfutil toolchain-manager launch --ncs-version v2.9.0 -- west init -m https://github.com/nrfconnect/sdk-nrf --mr v2.9.0
 
       - name: West update
         working-directory: ncs
-        run: nrfutil toolchain-manager launch --ncs-version v2.7.0 -- west update --narrow -o=--depth=1
+        run: nrfutil toolchain-manager launch --ncs-version v2.9.0 -- west update --narrow -o=--depth=1
         timeout-minutes: 30
 
       - name: Prepare config
         working-directory: omi-repo/omi/firmware/omi
         run: |
           cp omi.conf prj.conf
-          # MCUBOOT_NRF53_MULTI_IMAGE_UPDATE doesn't exist in NCS v2.7.0
-          # Comment it out — UPDATEABLE_IMAGES=2 still enables dual-core update
-          sed -i '/^SB_CONFIG_MCUBOOT_NRF53_MULTI_IMAGE_UPDATE/d' sysbuild.conf
-          echo "--- sysbuild.conf after patching ---"
-          cat sysbuild.conf
+          # Fix broken symlink: mcuboot.conf was saved as a symlink with file
+          # content as the target path (OMI issue #6350). Convert to regular file.
+          rm -f sysbuild/mcuboot.conf
+          cat > sysbuild/mcuboot.conf << 'MCUBOOT'
+          # MCUboot configuration for OMI production board
+          CONFIG_SPI_NOR=y
+          CONFIG_MCUBOOT_LOG_LEVEL_WRN=y
+          CONFIG_BOOT_UPGRADE_ONLY=y
+          CONFIG_MCUBOOT_DOWNGRADE_PREVENTION=y
+          CONFIG_NCS_SAMPLE_MCUMGR_BT_OTA_DFU=y
+          CONFIG_NORDIC_QSPI_NOR=n
+          CONFIG_BOOT_MAX_IMG_SECTORS=256
+          CONFIG_GPIO=y
+          CONFIG_SPI=y
+          CONFIG_FLASH=y
+          CONFIG_FLASH_JESD216_API=y
+          CONFIG_SPI_NOR_SFDP_DEVICETREE=y
+          CONFIG_SPI_NOR_FLASH_LAYOUT_PAGE_SIZE=4096
+          CONFIG_MULTITHREADING=y
+          CONFIG_DISK_DRIVER_SDMMC=y
+          CONFIG_DISK_ACCESS=y
+          CONFIG_FLASH_LOG_LEVEL_DBG=n
+          CONFIG_NRF53_MULTI_IMAGE_UPDATE=y
+          CONFIG_BOOT_MAX_IMG_SECTORS=256
+          CONFIG_MCUBOOT_DOWNGRADE_PREVENTION=y
+          MCUBOOT
+          echo "--- mcuboot.conf ---"
+          cat sysbuild/mcuboot.conf
 
       - name: Build firmware (unmodified upstream)
         working-directory: ncs
         run: |
-          nrfutil toolchain-manager launch --ncs-version v2.7.0 -- \
+          nrfutil toolchain-manager launch --ncs-version v2.9.0 -- \
             west build -b omi/nrf5340/cpuapp ${{ github.workspace }}/omi-repo/omi/firmware/omi \
               --sysbuild \
               -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware
