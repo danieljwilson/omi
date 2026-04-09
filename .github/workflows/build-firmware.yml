@@ -1,4 +1,4 @@
-name: Build OMI Firmware
+name: Build OMI Firmware (LED Control)
 
 on:
   push:
@@ -20,10 +20,9 @@ jobs:
           nrfutil install toolchain-manager
           nrfutil toolchain-manager install --ncs-version v2.9.0
 
-      - name: Checkout OMI repo (upstream, unmodified)
+      - name: Checkout patched OMI firmware
         uses: actions/checkout@v4
         with:
-          repository: BasedHardware/omi
           path: omi-repo
 
       - name: Initialize NCS workspace
@@ -66,10 +65,12 @@ jobs:
           CONFIG_BOOT_MAX_IMG_SECTORS=256
           CONFIG_MCUBOOT_DOWNGRADE_PREVENTION=y
           MCUBOOT
-          echo "--- mcuboot.conf ---"
-          cat sysbuild/mcuboot.conf
+          # Verify LED patch is present
+          echo "--- Verifying LED patch ---"
+          grep -c "led_control_write_handler" src/lib/core/transport.c && echo "LED patch: transport.c OK" || (echo "LED patch MISSING from transport.c" && exit 1)
+          grep -c "led_app_override" src/main.c && echo "LED patch: main.c OK" || (echo "LED patch MISSING from main.c" && exit 1)
 
-      - name: Build firmware (unmodified upstream)
+      - name: Build firmware (with LED control patch)
         working-directory: ncs
         run: |
           nrfutil toolchain-manager launch --ncs-version v2.9.0 -- \
@@ -81,6 +82,6 @@ jobs:
       - name: Upload DFU package
         uses: actions/upload-artifact@v4
         with:
-          name: omi-firmware-dfu
+          name: omi-firmware-led-control
           path: ncs/build/dfu_application.zip
           if-no-files-found: error
