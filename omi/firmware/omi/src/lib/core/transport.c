@@ -47,6 +47,7 @@ static bool storage_full_warned = false;
 
 extern bool is_connected;
 extern bool led_app_override;
+extern uint8_t led_app_color;
 static atomic_t pusher_stop_flag;
 
 struct bt_conn *current_connection = NULL;
@@ -631,6 +632,7 @@ static ssize_t led_control_write_handler(struct bt_conn *conn,
 
     uint8_t color = ((const uint8_t *)buf)[0];
     led_app_override = true;
+    led_app_color = color;
 
     switch (color) {
     case 0x00: // Blue - connected, idle
@@ -657,6 +659,7 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 
     is_connected = false;
     led_app_override = false;
+    led_app_color = 0x00;
 
     if (IS_ENABLED(CONFIG_SHELL_BT_NUS)) {
         shell_bt_nus_disable();
