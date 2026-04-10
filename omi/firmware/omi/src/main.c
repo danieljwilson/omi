@@ -128,6 +128,36 @@ static void boot_ready_sequence(void)
     k_msleep(10);
 }
 
+// Helper: set LED to show connection/recording state color
+// Disconnected = red, Connected = blue, Recording (app override) = green
+static void set_connection_color(void)
+{
+    if (led_app_override) {
+        // App has set the LED (green for recording, blue for idle)
+        // Don't touch — the app's last write is still active
+        return;
+    }
+    set_led_red(!is_connected);
+    set_led_green(false);
+    set_led_blue(is_connected);
+}
+
+// Helper: set LED to orange (red + green) = charging
+static void set_charging_color(void)
+{
+    set_led_red(true);
+    set_led_green(true);
+    set_led_blue(false);
+}
+
+// Helper: set LED to teal (green + blue) = fully charged
+static void set_fully_charged_color(void)
+{
+    set_led_red(false);
+    set_led_green(true);
+    set_led_blue(true);
+}
+
 void set_led_state()
 {
     // If device is off, turn off all LEDs immediately
@@ -136,48 +166,29 @@ void set_led_state()
         return;
     }
 
-    // If app has taken control of LED, don't override
-    if (led_app_override) {
-        blink_toggle = !blink_toggle;
-        return;
-    }
-
-#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
-    // If RTC not synced, blink red to warn user to connect phone app
-    if (!rtc_is_valid()) {
-        set_led_green(is_charging);
-        set_led_blue(!blink_toggle && is_connected);
-        set_led_red(blink_toggle);
-        blink_toggle = !blink_toggle;
-        return;
-    }
+    bool battery_full = false;
+#ifdef CONFIG_OMI_ENABLE_BATTERY
+    battery_full = (battery_percentage >= BATTERY_FULL_THRESHOLD_PERCENT);
 #endif
-
-    bool green = false;
-    bool blue = false;
-    bool red = false;
 
     if (is_charging) {
-#ifdef CONFIG_OMI_ENABLE_BATTERY
-        // Solid green if battery is full (>= BATTERY_FULL_THRESHOLD_PERCENT)
-        if (battery_percentage >= BATTERY_FULL_THRESHOLD_PERCENT) {
-            green = true;
-        } else
-#endif
-        {
-            green = blink_toggle;
-            blue = !blink_toggle && is_connected;
-            red = !blink_toggle && !is_connected;
-            blink_toggle = !blink_toggle;
+        // Alternate between charge-status color and connection color
+        if (blink_toggle) {
+            // Color 1: charging status
+            if (battery_full) {
+                set_fully_charged_color(); // teal
+            } else {
+                set_charging_color(); // orange
+            }
+        } else {
+            // Color 2: connection/recording status
+            set_connection_color();
         }
+        blink_toggle = !blink_toggle;
     } else {
-        blue = is_connected;
-        red = !is_connected;
+        // Not charging: solid connection color
+        set_connection_color();
     }
-
-    set_led_green(green);
-    set_led_blue(blue);
-    set_led_red(red);
 }
 
 static int suspend_unused_modules(void)
