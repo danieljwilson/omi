@@ -37,6 +37,8 @@ bool is_connected = false;
 bool is_charging = false;
 bool is_off = false;
 bool led_app_override = false;
+// Last color set by app: 0x00=blue, 0x01=green (matches BLE protocol)
+uint8_t led_app_color = 0x00;
 bool blink_toggle = false;
 
 static void print_reset_reason(void)
@@ -128,21 +130,32 @@ static void boot_ready_sequence(void)
     k_msleep(10);
 }
 
-// Helper: set LED to show connection/recording state color
-// Disconnected = red, Connected = blue, Recording (app override) = green
+// Set LED to the connection/recording state color.
+// If app has override: restore the app's last-written color.
+// Otherwise: disconnected=red, connected=blue.
 static void set_connection_color(void)
 {
     if (led_app_override) {
-        // App has set the LED (green for recording, blue for idle)
-        // Don't touch — the app's last write is still active
-        return;
+        switch (led_app_color) {
+        case 0x01: // Green - recording
+            set_led_red(false);
+            set_led_green(true);
+            set_led_blue(false);
+            break;
+        default: // 0x00 - Blue - connected idle
+            set_led_red(false);
+            set_led_green(false);
+            set_led_blue(true);
+            break;
+        }
+    } else {
+        set_led_red(!is_connected);
+        set_led_green(false);
+        set_led_blue(is_connected);
     }
-    set_led_red(!is_connected);
-    set_led_green(false);
-    set_led_blue(is_connected);
 }
 
-// Helper: set LED to orange (red + green) = charging
+// Orange (red + green) = charging
 static void set_charging_color(void)
 {
     set_led_red(true);
@@ -150,7 +163,7 @@ static void set_charging_color(void)
     set_led_blue(false);
 }
 
-// Helper: set LED to teal (green + blue) = fully charged
+// Teal (green + blue) = fully charged
 static void set_fully_charged_color(void)
 {
     set_led_red(false);
@@ -172,7 +185,7 @@ void set_led_state()
 #endif
 
     if (is_charging) {
-        // Alternate between charge-status color and connection color
+        // Alternate every 1s between charge-status color and connection color
         if (blink_toggle) {
             // Color 1: charging status
             if (battery_full) {
@@ -186,7 +199,7 @@ void set_led_state()
         }
         blink_toggle = !blink_toggle;
     } else {
-        // Not charging: solid connection color
+        // Not charging: solid connection/recording color
         set_connection_color();
     }
 }
