@@ -21,7 +21,7 @@ jobs:
           nrfutil toolchain-manager install --ncs-version v2.9.0
 
       - name: Checkout patched OMI firmware
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: omi-repo
 
@@ -61,7 +61,7 @@ jobs:
         timeout-minutes: 15
 
       - name: Upload DFU package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: omi-firmware-offline-recording
           path: ncs/build/dfu_application.zip
