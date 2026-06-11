@@ -1,0 +1,68 @@
+name: Build OMI Firmware (offline-recording)
+
+on:
+  push:
+    branches: [offline-recording]
+    paths:
+      - 'omi/firmware/**'
+      - '.github/workflows/build-firmware.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install nrfutil and toolchain
+        run: |
+          wget -q https://developer.nordicsemi.com/.pc-tools/nrfutil/x64-linux/nrfutil
+          chmod +x nrfutil
+          sudo mv nrfutil /usr/local/bin/
+          nrfutil install toolchain-manager
+          nrfutil toolchain-manager install --ncs-version v2.9.0
+
+      - name: Checkout patched OMI firmware
+        uses: actions/checkout@v4
+        with:
+          path: omi-repo
+
+      - name: Initialize NCS workspace
+        run: |
+          mkdir -p ncs && cd ncs
+          nrfutil toolchain-manager launch --ncs-version v2.9.0 -- west init -m https://github.com/nrfconnect/sdk-nrf --mr v2.9.0
+
+      - name: West update
+        working-directory: ncs
+        run: nrfutil toolchain-manager launch --ncs-version v2.9.0 -- west update --narrow -o=--depth=1
+        timeout-minutes: 30
+
+      - name: Prepare config
+        working-directory: omi-repo/omi/firmware/omi
+        run: |
+          cp omi.conf prj.conf
+          # mcuboot.conf symlink bug (OMI issue #6350) is fixed upstream;
+          # sanity-check it is a regular file, not a symlink.
+          if [ -L sysbuild/mcuboot.conf ]; then
+            echo "sysbuild/mcuboot.conf is a symlink again — apply the #6350 fix" && exit 1
+          fi
+          # Verify Pairent patches are present
+          echo "--- Verifying Pairent patches ---"
+          grep -q "led_control_write_handler" src/lib/core/transport.c && echo "LED patch: transport.c OK" || (echo "LED patch MISSING from transport.c" && exit 1)
+          grep -q "led_app_override" src/main.c && echo "LED patch: main.c OK" || (echo "LED patch MISSING from main.c" && exit 1)
+          grep -q "offline_rec_enabled" src/lib/core/transport.c && echo "SD-primary patch: transport.c OK" || (echo "SD-primary patch MISSING from transport.c" && exit 1)
+          test -f src/lib/core/offline_rec.c && echo "offline_rec module OK" || (echo "offline_rec.c MISSING" && exit 1)
+
+      - name: Build firmware (offline-recording)
+        working-directory: ncs
+        run: |
+          nrfutil toolchain-manager launch --ncs-version v2.9.0 -- \
+            west build -b omi/nrf5340/cpuapp ${{ github.workspace }}/omi-repo/omi/firmware/omi \
+              --sysbuild \
+              -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware
+        timeout-minutes: 15
+
+      - name: Upload DFU package
+        uses: actions/upload-artifact@v4
+        with:
+          name: omi-firmware-offline-recording
+          path: ncs/build/dfu_application.zip
+          if-no-files-found: error

@@ -25,7 +25,11 @@
 #include "config.h"
 #include "features.h"
 #include "haptic.h"
+#include "led.h"
 #include "mic.h"
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+#include "offline_rec.h"
+#endif
 #ifdef CONFIG_OMI_ENABLE_MONITOR
 #include "monitor.h"
 #endif
@@ -46,6 +50,8 @@ static bool storage_full_warned = false;
 #endif
 
 extern bool is_connected;
+extern bool led_app_override;
+extern uint8_t led_app_color;
 #ifdef CONFIG_OMI_ENABLE_BATTERY
 extern bool is_charging;
 #endif
@@ -61,6 +67,32 @@ static ssize_t audio_data_write_handler(struct bt_conn *conn,
                                         uint16_t len,
                                         uint16_t offset,
                                         uint8_t flags);
+
+static ssize_t led_control_write_handler(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         const void *buf,
+                                         uint16_t len,
+                                         uint16_t offset,
+                                         uint8_t flags);
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+static ssize_t offline_ctrl_read_handler(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         void *buf,
+                                         uint16_t len,
+                                         uint16_t offset);
+static ssize_t offline_ctrl_write_handler(struct bt_conn *conn,
+                                          const struct bt_gatt_attr *attr,
+                                          const void *buf,
+                                          uint16_t len,
+                                          uint16_t offset,
+                                          uint8_t flags);
+static void offline_ctrl_ccc_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
+static ssize_t offline_markers_read_handler(struct bt_conn *conn,
+                                            const struct bt_gatt_attr *attr,
+                                            void *buf,
+                                            uint16_t len,
+                                            uint16_t offset);
+#endif
 
 static struct bt_conn_cb _callback_references;
 static void audio_ccc_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value);
@@ -140,6 +172,15 @@ static struct bt_uuid_128 audio_characteristic_format_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10002, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
 static struct bt_uuid_128 audio_characteristic_speaker_uuid =
     BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10003, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+// Pairent custom characteristics (19B10006-19B10008)
+static struct bt_uuid_128 audio_characteristic_led_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10006, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+static struct bt_uuid_128 offline_ctrl_characteristic_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10007, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+static struct bt_uuid_128 offline_markers_characteristic_uuid =
+    BT_UUID_INIT_128(BT_UUID_128_ENCODE(0x19B10008, 0xE8F2, 0x537E, 0x4F6C, 0xD104768A1214));
+#endif
 
 static struct bt_gatt_attr audio_service_attr[] = {
     BT_GATT_PRIMARY_SERVICE(&audio_service_uuid),
@@ -164,6 +205,29 @@ static struct bt_gatt_attr audio_service_attr[] = {
                            audio_data_write_handler,
                            NULL),
     BT_GATT_CCC(audio_ccc_config_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), //
+#endif
+
+    BT_GATT_CHARACTERISTIC(&audio_characteristic_led_uuid.uuid,
+                           BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+                           BT_GATT_PERM_WRITE,
+                           NULL,
+                           led_control_write_handler,
+                           NULL),
+
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    BT_GATT_CHARACTERISTIC(&offline_ctrl_characteristic_uuid.uuid,
+                           BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE | BT_GATT_CHRC_NOTIFY,
+                           BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+                           offline_ctrl_read_handler,
+                           offline_ctrl_write_handler,
+                           NULL),
+    BT_GATT_CCC(offline_ctrl_ccc_changed_handler, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+    BT_GATT_CHARACTERISTIC(&offline_markers_characteristic_uuid.uuid,
+                           BT_GATT_CHRC_READ,
+                           BT_GATT_PERM_READ,
+                           offline_markers_read_handler,
+                           NULL,
+                           NULL),
 #endif
 
 };
@@ -665,12 +729,146 @@ K_SEM_DEFINE(audio_tx_sem,
              CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS,
              CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS);
 
+// --- LED control characteristic write handler ---
+// App writes 0x00 = blue (idle), 0x01 = green (recording)
+static ssize_t led_control_write_handler(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         const void *buf,
+                                         uint16_t len,
+                                         uint16_t offset,
+                                         uint8_t flags)
+{
+    if (len < 1) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
+
+    uint8_t color = ((const uint8_t *) buf)[0];
+    led_app_override = true;
+    led_app_color = color;
+
+    switch (color) {
+    case 0x00: // Blue - connected, idle
+        set_led_red(false);
+        set_led_green(false);
+        set_led_blue(true);
+        break;
+    case 0x01: // Green - recording
+        set_led_red(false);
+        set_led_green(true);
+        set_led_blue(false);
+        break;
+    default:
+        break;
+    }
+
+    return len;
+}
+
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+// --- Offline recording control/status characteristic (19B10007) ---
+// Read/notify: 16-byte status payload (see offline_rec_get_status).
+// Write: 0x00 = stop recording, 0x01 = start recording, 0x02 = clear markers.
+
+static const struct bt_gatt_attr *offline_ctrl_attr(void)
+{
+    static const struct bt_gatt_attr *attr;
+    if (attr == NULL) {
+        attr = bt_gatt_find_by_uuid(audio_service.attrs, audio_service.attr_count, &offline_ctrl_characteristic_uuid.uuid);
+    }
+    return attr;
+}
+
+void transport_notify_offline_status(void)
+{
+    struct bt_conn *conn = current_connection;
+    const struct bt_gatt_attr *attr = offline_ctrl_attr();
+    if (conn == NULL || attr == NULL) {
+        return;
+    }
+    if (!bt_gatt_is_subscribed(conn, attr, BT_GATT_CCC_NOTIFY)) {
+        return;
+    }
+
+    uint8_t status[OFFLINE_REC_STATUS_LEN];
+    offline_rec_get_status(status);
+    bt_gatt_notify(conn, attr, status, sizeof(status));
+}
+
+static ssize_t offline_ctrl_read_handler(struct bt_conn *conn,
+                                         const struct bt_gatt_attr *attr,
+                                         void *buf,
+                                         uint16_t len,
+                                         uint16_t offset)
+{
+    uint8_t status[OFFLINE_REC_STATUS_LEN];
+    offline_rec_get_status(status);
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, status, sizeof(status));
+}
+
+static ssize_t offline_ctrl_write_handler(struct bt_conn *conn,
+                                          const struct bt_gatt_attr *attr,
+                                          const void *buf,
+                                          uint16_t len,
+                                          uint16_t offset,
+                                          uint8_t flags)
+{
+    if (len < 1) {
+        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    }
+
+    switch (((const uint8_t *) buf)[0]) {
+    case 0x00:
+        offline_rec_set_enabled(false);
+        break;
+    case 0x01:
+        offline_rec_set_enabled(true);
+        break;
+    case 0x02:
+        offline_rec_clear_markers();
+        break;
+    default:
+        return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+    }
+
+    return len;
+}
+
+static void offline_ctrl_ccc_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    if (value == BT_GATT_CCC_NOTIFY) {
+        LOG_INF("Client subscribed for offline status notifications");
+        // Acts as the data-ready signal right after (re)connection.
+        transport_notify_offline_status();
+    }
+}
+
+static ssize_t offline_markers_read_handler(struct bt_conn *conn,
+                                            const struct bt_gatt_attr *attr,
+                                            void *buf,
+                                            uint16_t len,
+                                            uint16_t offset)
+{
+    static uint8_t markers_buf[1 + OFFLINE_REC_MAX_MARKERS * 4];
+    int payload_len = offline_rec_read_markers(markers_buf, sizeof(markers_buf));
+    if (payload_len < 0) {
+        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+    }
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, markers_buf, payload_len);
+}
+#else
+void transport_notify_offline_status(void)
+{
+}
+#endif
+
 static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 {
     k_work_cancel_delayable(&mtu_recheck_work);
     mtu_recheck_attempts = 0;
 
     is_connected = false;
+    led_app_override = false;
+    led_app_color = 0x00;
 
     if (IS_ENABLED(CONFIG_SHELL_BT_NUS)) {
         shell_bt_nus_disable();
@@ -1225,24 +1423,34 @@ void pusher(void)
                 }
             }
 
-            if (conn && is_subscribed) {
-                push_to_gatt(conn);
-                bt_conn_unref(conn);
-            } else if (!conn) {
+            // SD-primary (Pairent): when offline recording is enabled, every
+            // frame goes to SD regardless of connection state. Live streaming
+            // is an optional second consumer of the same frame. Storage is
+            // written first so BLE backpressure never delays capture.
+            // Standby (double-tap stop) suppresses SD capture even while
+            // disconnected — stopped must mean stopped.
+            bool stored = false;
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+            if (offline_rec_enabled()) {
                 if (get_file_size() < MAX_STORAGE_BYTES && is_sd_on()) {
                     storage_full_warned = false;
                     write_to_storage();
+                    stored = true;
                 } else {
                     if (!storage_full_warned) {
                         LOG_WRN("Storage full, stopping offline storage");
                         storage_full_warned = true;
                     }
                 }
+            }
 #endif
-            } else {
+            if (conn) {
+                if (is_subscribed) {
+                    push_to_gatt(conn);
+                } else if (!stored) {
+                    k_sleep(K_MSEC(10));
+                }
                 bt_conn_unref(conn);
-                k_sleep(K_MSEC(10));
             }
         }
     }

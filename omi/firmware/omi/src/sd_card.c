@@ -12,6 +12,9 @@
  *   - SD card has internal wear leveling â†’ block_cycles = -1
  */
 #include "lib/core/sd_card.h"
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+#include "lib/core/offline_rec.h"
+#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -342,8 +345,20 @@ static void process_write_data_req(const sd_req_t *req)
 {
     if (sd_write_blocked)
         return;
-    if (current_file_deleted && ble_connected)
-        return;
+    if (current_file_deleted) {
+        /* Stock behavior: after the app deletes the in-progress file during
+         * sync, stop writing until disconnect creates a new file. Under
+         * SD-primary recording (Pairent) that would silently drop audio
+         * while connected — clear the flag and fall through to the
+         * lazy-create below instead. */
+        bool resume_now = false;
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+        resume_now = offline_rec_enabled();
+#endif
+        if (!resume_now && ble_connected)
+            return;
+        current_file_deleted = false;
+    }
 
     /* Track whether we woke SPI for I/O in this call so we can
      * suspend it once at the end — keeps SPI + SD card powered

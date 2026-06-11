@@ -12,9 +12,12 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 
+#include "offline_rec.h"
 #include "sd_card.h"
 #include "transport.h"
 #include "utils.h"
+
+extern bool is_charging;
 
 LOG_MODULE_REGISTER(storage, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -165,8 +168,13 @@ static ssize_t storage_read_characteristic(struct bt_conn *conn,
     uint32_t payload[4] = {0};
     payload[0] = (uint32_t)cached_total_size;   /* total used bytes */
     payload[1] = cached_file_count;             /* number of audio files */
-    payload[2] = 0;                      /* free_bytes — TODO: implement disk_access_ioctl */
-    payload[3] = 0;                      /* status_flags: bit0=charging, bit1=warning, bit2=error */
+    /* free vs the MAX_STORAGE_BYTES usable cap (not raw disk free) */
+    payload[2] = (cached_total_size < MAX_STORAGE_BYTES)
+                     ? (uint32_t)(MAX_STORAGE_BYTES - cached_total_size)
+                     : 0;
+    /* status_flags: bit0=charging, bit1=storage warning (low/evicting) */
+    payload[3] = (is_charging ? 1U : 0U) |
+                 ((offline_rec_storage_state() != OFFLINE_REC_STORAGE_OK) ? 2U : 0U);
     
     LOG_INF("Storage read: used=%u bytes, files=%u", payload[0], payload[1]);
     return bt_gatt_attr_read(conn, attr, buf, len, offset, payload, sizeof(payload));
@@ -735,6 +743,10 @@ void storage_write(void)
                 }
             }
         }
+
+        // Pairent: storage stats refresh + oldest-file eviction + status
+        // notify (self-throttled to one pass per 30 s inside).
+        offline_rec_housekeep();
 
         // Sleep when there's no work
         if (remaining_length == 0 && !stop_started) {

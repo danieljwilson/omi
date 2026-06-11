@@ -21,6 +21,7 @@
 
 #include "imu.h"
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+#include "offline_rec.h"
 #include "sd_card.h"
 #endif
 
@@ -215,19 +216,31 @@ void check_button_level(struct k_work *work_item)
         event = BUTTON_EVENT_LONG_PRESS;
     }
 
-    // Single tap
+    // Single tap: flag a moment (works phone-free; BLE notify kept for the app)
     if (event == BUTTON_EVENT_SINGLE_TAP) {
         LOG_INF("single tap detected\n");
         btn_last_event = event;
 
         notify_tap();
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+        offline_rec_add_marker();
+#ifdef CONFIG_OMI_ENABLE_HAPTIC
+        play_haptic_milli(60);
+#endif
+#endif
     }
 
-    // Double tap
+    // Double tap: toggle SD-primary recording (works phone-free)
     if (event == BUTTON_EVENT_DOUBLE_TAP) {
         LOG_INF("double tap detected\n");
         btn_last_event = event;
         notify_double_tap();
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+        offline_rec_toggle();
+#ifdef CONFIG_OMI_ENABLE_HAPTIC
+        play_haptic_milli(150);
+#endif
+#endif
     }
 
     // Long press, one time event

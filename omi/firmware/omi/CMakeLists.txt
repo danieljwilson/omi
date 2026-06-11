@@ -31,7 +31,7 @@ file(GLOB core_sources
 )
 
 if(CONFIG_OMI_ENABLE_OFFLINE_STORAGE)
-    list(APPEND core_sources src/lib/core/storage.c)
+    list(APPEND core_sources src/lib/core/storage.c src/lib/core/offline_rec.c)
 endif()
 
 target_sources(app PRIVATE ${core_sources} ${app_sources})

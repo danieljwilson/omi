@@ -17,6 +17,7 @@
 #include "lib/core/settings.h"
 #include "lib/core/transport.h"
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+#include "lib/core/offline_rec.h"
 #include "lib/core/storage.h"
 #endif
 #include <hal/nrf_reset.h>
@@ -39,6 +40,9 @@ extern uint8_t battery_percentage;
 bool is_connected = false;
 bool is_charging = false;
 bool is_off = false;
+bool led_app_override = false;
+// Last color set by app via 19B10006: 0x00=blue, 0x01=green
+uint8_t led_app_color = 0x00;
 bool blink_toggle = false;
 
 static void print_reset_reason(void)
@@ -136,6 +140,68 @@ static void boot_ready_sequence(void)
     k_msleep(10);
 }
 
+// Status color: app override > recording (green, red-alternating when
+// attention needed) > standby (blue). BLE connection state is intentionally
+// NOT shown — with SD-primary recording it no longer matters to the wearer.
+// warn_phase alternates at the 1 s main-loop tick to blink warnings.
+static void set_status_color(bool warn_phase)
+{
+    if (led_app_override) {
+        switch (led_app_color) {
+        case 0x01: // Green - recording
+            set_led_red(false);
+            set_led_green(true);
+            set_led_blue(false);
+            break;
+        default: // 0x00 - Blue - idle
+            set_led_red(false);
+            set_led_green(false);
+            set_led_blue(true);
+            break;
+        }
+        return;
+    }
+
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    if (offline_rec_enabled()) {
+        // Attention = storage low/evicting, or clock unsynced (file
+        // timestamps provisional). Both are fixed by connecting the phone.
+        bool attention = (offline_rec_storage_state() != OFFLINE_REC_STORAGE_OK) || !rtc_is_valid();
+        if (attention && warn_phase) {
+            set_led_red(true);
+            set_led_green(false);
+            set_led_blue(false);
+        } else {
+            set_led_red(false);
+            set_led_green(true);
+            set_led_blue(false);
+        }
+        return;
+    }
+#endif
+
+    // Standby: solid blue
+    set_led_red(false);
+    set_led_green(false);
+    set_led_blue(true);
+}
+
+// Orange (red + green) = charging
+static void set_charging_color(void)
+{
+    set_led_red(true);
+    set_led_green(true);
+    set_led_blue(false);
+}
+
+// Teal (green + blue) = fully charged
+static void set_fully_charged_color(void)
+{
+    set_led_red(false);
+    set_led_green(true);
+    set_led_blue(true);
+}
+
 void set_led_state()
 {
     // If device is off, turn off all LEDs immediately
@@ -144,42 +210,26 @@ void set_led_state()
         return;
     }
 
-#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
-    // If RTC not synced, blink red to warn user to connect phone app
-    if (!rtc_is_valid()) {
-        set_led_green(is_charging);
-        set_led_blue(!blink_toggle && is_connected);
-        set_led_red(blink_toggle);
-        blink_toggle = !blink_toggle;
-        return;
-    }
+    bool battery_full = false;
+#ifdef CONFIG_OMI_ENABLE_BATTERY
+    battery_full = (battery_percentage >= BATTERY_FULL_THRESHOLD_PERCENT);
 #endif
-
-    bool green = false;
-    bool blue = false;
-    bool red = false;
 
     if (is_charging) {
-#ifdef CONFIG_OMI_ENABLE_BATTERY
-        // Solid green if battery is full (>= BATTERY_FULL_THRESHOLD_PERCENT)
-        if (battery_percentage >= BATTERY_FULL_THRESHOLD_PERCENT) {
-            green = true;
-        } else
-#endif
-        {
-            green = blink_toggle;
-            blue = !blink_toggle && is_connected;
-            red = !blink_toggle && !is_connected;
-            blink_toggle = !blink_toggle;
+        // Alternate every 1 s between charge-status color and status color
+        if (blink_toggle) {
+            if (battery_full) {
+                set_fully_charged_color(); // teal
+            } else {
+                set_charging_color(); // orange
+            }
+        } else {
+            set_status_color(false);
         }
     } else {
-        blue = is_connected;
-        red = !is_connected;
+        set_status_color(blink_toggle);
     }
-
-    set_led_green(green);
-    set_led_blue(blue);
-    set_led_red(red);
+    blink_toggle = !blink_toggle;
 }
 
 static int suspend_unused_modules(void)
@@ -316,6 +366,9 @@ int main(void)
     } else {
         LOG_INF("Storage service initialized");
     }
+
+    // Pairent: SD-primary recording state (restored from settings)
+    offline_rec_init();
 #endif
 
     // Indicate transport initialization
