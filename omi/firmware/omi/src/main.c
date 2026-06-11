@@ -35,6 +35,7 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
 #ifdef CONFIG_OMI_ENABLE_BATTERY
 #define BATTERY_FULL_THRESHOLD_PERCENT 98 // 98%
+#define BATTERY_LOW_THRESHOLD_PERCENT 10  // matches the app's warning threshold
 extern uint8_t battery_percentage;
 #endif
 bool is_connected = false;
@@ -43,7 +44,6 @@ bool is_off = false;
 bool led_app_override = false;
 // Last color set by app via 19B10006: 0x00=blue, 0x01=green
 uint8_t led_app_color = 0x00;
-bool blink_toggle = false;
 
 static void print_reset_reason(void)
 {
@@ -140,96 +140,79 @@ static void boot_ready_sequence(void)
     k_msleep(10);
 }
 
-// Status color: app override > recording (green, red-alternating when
-// attention needed) > standby (blue). BLE connection state is intentionally
-// NOT shown — with SD-primary recording it no longer matters to the wearer.
-// warn_phase alternates at the 1 s main-loop tick to blink warnings.
-static void set_status_color(bool warn_phase)
+// LED grammar (two-slot alternation, decided 2026-06-11):
+// Each color means exactly one thing —
+//   green/blue = base (recording/standby), orange/teal = charging/full,
+//   red = low battery, purple = connect phone (storage low or clock unsynced).
+// All good: solid base. Otherwise the LED cycles 1 s frames through
+// [base, modifier, (modifier2)]. Charge state and low battery are mutually
+// exclusive, so the cycle never exceeds 3 frames. BLE connection state is
+// intentionally NOT shown — with SD-primary recording it no longer matters.
+enum led_status_color {
+    LSC_GREEN,
+    LSC_BLUE,
+    LSC_RED,
+    LSC_ORANGE,
+    LSC_TEAL,
+    LSC_PURPLE,
+};
+
+static void set_status_led(enum led_status_color color)
 {
-    if (led_app_override) {
-        switch (led_app_color) {
-        case 0x01: // Green - recording
-            set_led_red(false);
-            set_led_green(true);
-            set_led_blue(false);
-            break;
-        default: // 0x00 - Blue - idle
-            set_led_red(false);
-            set_led_green(false);
-            set_led_blue(true);
-            break;
-        }
-        return;
-    }
-
-#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
-    if (offline_rec_enabled()) {
-        // Attention = storage low/evicting, or clock unsynced (file
-        // timestamps provisional). Both are fixed by connecting the phone.
-        bool attention = (offline_rec_storage_state() != OFFLINE_REC_STORAGE_OK) || !rtc_is_valid();
-        if (attention && warn_phase) {
-            set_led_red(true);
-            set_led_green(false);
-            set_led_blue(false);
-        } else {
-            set_led_red(false);
-            set_led_green(true);
-            set_led_blue(false);
-        }
-        return;
-    }
-#endif
-
-    // Standby: solid blue
-    set_led_red(false);
-    set_led_green(false);
-    set_led_blue(true);
-}
-
-// Orange (red + green) = charging
-static void set_charging_color(void)
-{
-    set_led_red(true);
-    set_led_green(true);
-    set_led_blue(false);
-}
-
-// Teal (green + blue) = fully charged
-static void set_fully_charged_color(void)
-{
-    set_led_red(false);
-    set_led_green(true);
-    set_led_blue(true);
+    set_led_red(color == LSC_RED || color == LSC_ORANGE || color == LSC_PURPLE);
+    set_led_green(color == LSC_GREEN || color == LSC_ORANGE || color == LSC_TEAL);
+    set_led_blue(color == LSC_BLUE || color == LSC_TEAL || color == LSC_PURPLE);
 }
 
 void set_led_state()
 {
+    static uint8_t led_frame = 0;
+
     // If device is off, turn off all LEDs immediately
     if (is_off) {
         led_off();
         return;
     }
 
-    bool battery_full = false;
+    // App override via 19B10006 wins (cleared on disconnect)
+    if (led_app_override) {
+        set_status_led(led_app_color == 0x01 ? LSC_GREEN : LSC_BLUE);
+        return;
+    }
+
+    enum led_status_color frames[3];
+    uint8_t count = 0;
+
+    // Base
+    bool recording = false;
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    recording = offline_rec_enabled();
+#endif
+    frames[count++] = recording ? LSC_GREEN : LSC_BLUE;
+
+    // Modifier 1: charge state, or low battery when off the charger
 #ifdef CONFIG_OMI_ENABLE_BATTERY
-    battery_full = (battery_percentage >= BATTERY_FULL_THRESHOLD_PERCENT);
+    if (is_charging) {
+        frames[count++] = (battery_percentage >= BATTERY_FULL_THRESHOLD_PERCENT) ? LSC_TEAL : LSC_ORANGE;
+    } else if (battery_percentage <= BATTERY_LOW_THRESHOLD_PERCENT) {
+        frames[count++] = LSC_RED;
+    }
+#else
+    if (is_charging) {
+        frames[count++] = LSC_ORANGE;
+    }
 #endif
 
-    if (is_charging) {
-        // Alternate every 1 s between charge-status color and status color
-        if (blink_toggle) {
-            if (battery_full) {
-                set_fully_charged_color(); // teal
-            } else {
-                set_charging_color(); // orange
-            }
-        } else {
-            set_status_color(false);
-        }
-    } else {
-        set_status_color(blink_toggle);
+    // Modifier 2: connect phone — storage low/evicting or clock unsynced,
+    // both fixed by connecting the phone
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    if (offline_rec_storage_state() != OFFLINE_REC_STORAGE_OK || !rtc_is_valid()) {
+        frames[count++] = LSC_PURPLE;
     }
-    blink_toggle = !blink_toggle;
+#endif
+
+    led_frame = (uint8_t) ((led_frame + 1) % count);
+    set_status_led(frames[led_frame]);
 }
 
 static int suspend_unused_modules(void)
