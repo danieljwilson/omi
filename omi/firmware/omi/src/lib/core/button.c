@@ -367,6 +367,11 @@ void turnoff_all()
     // Set is_off immediately so set_led_state() keeps LEDs off
     is_off = true;
 
+#ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
+    // Record that this shutdown was intentional (boot forensics)
+    offline_rec_mark_clean_shutdown();
+#endif
+
 #ifdef CONFIG_OMI_ENABLE_HAPTIC
     play_haptic_milli(100);
     k_msleep(300);

@@ -18,7 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define OFFLINE_REC_STATUS_LEN 16
+#define OFFLINE_REC_STATUS_LEN 20
 #define OFFLINE_REC_MAX_MARKERS 120
 
 /* Storage states reported in the status payload */
@@ -29,10 +29,24 @@
 /**
  * @brief Initialize module state (after settings + SD init).
  *
- * Persisted state (enabled flag, markers) is restored by the settings
- * subsystem during settings_load(); this only logs and sanity-checks.
+ * Persisted state (enabled flag, markers, boot count) is restored by the
+ * settings subsystem during settings_load(). Increments the persisted boot
+ * counter, records this boot's reset-reason code for the status payload,
+ * and consumes the previous run's clean-shutdown flag.
+ *
+ * @param reset_code Compact reset-reason code from print_reset_reason()
+ *                   (0=power-on, 1=pin, 2=watchdog, 3=lockup, 4=soft,
+ *                   5=other, 6=NFC, 7=wake from System OFF).
  */
-int offline_rec_init(void);
+int offline_rec_init(uint8_t reset_code);
+
+/**
+ * @brief Mark the current shutdown as clean (call from the power-off path).
+ *
+ * If the next boot does NOT see this flag, the previous run ended uncleanly
+ * (freeze, battery death, crash) — surfaced in the status payload.
+ */
+void offline_rec_mark_clean_shutdown(void);
 
 /** @brief Whether SD-primary recording is currently enabled. */
 bool offline_rec_enabled(void);
@@ -69,14 +83,17 @@ void offline_rec_clear_markers(void);
 uint8_t offline_rec_storage_state(void);
 
 /**
- * @brief Fill the 16-byte status payload (little-endian):
- *   [0]      protocol version (1)
+ * @brief Fill the 20-byte status payload (little-endian):
+ *   [0]      protocol version (2)
  *   [1]      recording enabled (0/1)
  *   [2]      storage state (OFFLINE_REC_STORAGE_*)
  *   [3]      marker count
  *   [4..7]   used bytes (u32)
  *   [8..11]  free bytes vs 480 MB cap (u32)
  *   [12..15] device UTC epoch seconds, 0 if unsynced (u32)
+ *   [16]     reset-reason code of the current boot (see offline_rec_init)
+ *   [17..18] boot count (u16, persisted; monotonic across reboots)
+ *   [19]     flags: bit0 = previous shutdown was clean
  */
 void offline_rec_get_status(uint8_t out[OFFLINE_REC_STATUS_LEN]);
 

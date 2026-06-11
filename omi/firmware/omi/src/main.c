@@ -45,28 +45,44 @@ bool led_app_override = false;
 // Last color set by app via 19B10006: 0x00=blue, 0x01=green
 uint8_t led_app_color = 0x00;
 
-static void print_reset_reason(void)
+// Returns a compact reset-reason code for the 19B10007 status payload:
+// 0=power-on/brownout, 1=pin, 2=watchdog, 3=lockup, 4=soft request,
+// 5=other, 6=NFC wake, 7=GPIO wake from System OFF
+static uint8_t print_reset_reason(void)
 {
     uint32_t reas;
+    uint8_t code;
 
     reas = nrf_reset_resetreas_get(NRF_RESET);
     nrf_reset_resetreas_clear(NRF_RESET, reas);
 
     if (reas & NRF_RESET_RESETREAS_DOG0_MASK) {
         printk("Reset by WATCHDOG\n");
+        code = 2;
     } else if (reas & NRF_RESET_RESETREAS_NFC_MASK) {
         printk("Wake up by NFC field detect\n");
+        code = 6;
     } else if (reas & NRF_RESET_RESETREAS_RESETPIN_MASK) {
         printk("Reset by pin-reset\n");
+        code = 1;
     } else if (reas & NRF_RESET_RESETREAS_SREQ_MASK) {
         printk("Reset by soft-reset\n");
+        code = 4;
     } else if (reas & NRF_RESET_RESETREAS_LOCKUP_MASK) {
         printk("Reset by CPU LOCKUP\n");
+        code = 3;
+    } else if (reas & NRF_RESET_RESETREAS_OFF_MASK) {
+        printk("Wake up from System OFF\n");
+        code = 7;
     } else if (reas) {
         printk("Reset by a different source (0x%08X)\n", reas);
+        code = 5;
     } else {
         printk("Power-on-reset\n");
+        code = 0;
     }
+
+    return code;
 }
 
 static void codec_handler(uint8_t *data, size_t len)
@@ -231,7 +247,8 @@ int main(void)
     printk("Starting omi ...\n");
 
     // print reset reason at startup
-    print_reset_reason();
+    uint8_t reset_code = print_reset_reason();
+    (void) reset_code;
 
     // Initialize watchdog first to catch any early freezes
     ret = watchdog_init();
@@ -351,7 +368,7 @@ int main(void)
     }
 
     // Pairent: SD-primary recording state (restored from settings)
-    offline_rec_init();
+    offline_rec_init(reset_code);
 #endif
 
     // Indicate transport initialization

@@ -31,6 +31,12 @@ static uint64_t used_bytes_cached = 0;
 static uint32_t markers[OFFLINE_REC_MAX_MARKERS];
 static uint8_t marker_count = 0;
 
+/* Boot forensics (2026-06-11 field freeze): which reset brought us up, how
+ * many boots total, and whether the previous run powered off cleanly. */
+static uint8_t last_reset_code = 0;
+static uint16_t boot_count = 0;
+static bool prev_shutdown_clean = false;
+
 /* ------------------------------------------------------------------ */
 /* Persistence: dedicated "pairent" settings subtree                   */
 /* ------------------------------------------------------------------ */
@@ -69,6 +75,30 @@ static int pairent_settings_set(const char *name, size_t len, settings_read_cb r
         return 0;
     }
 
+    if (settings_name_steq(name, "boot_cnt", &next) && !next) {
+        uint16_t val = 0;
+        if (len != sizeof(val)) {
+            return -EINVAL;
+        }
+        if (read_cb(cb_arg, &val, sizeof(val)) < 0) {
+            return -EIO;
+        }
+        boot_count = val;
+        return 0;
+    }
+
+    if (settings_name_steq(name, "clean_sd", &next) && !next) {
+        uint8_t val = 0;
+        if (len != sizeof(val)) {
+            return -EINVAL;
+        }
+        if (read_cb(cb_arg, &val, sizeof(val)) < 0) {
+            return -EIO;
+        }
+        prev_shutdown_clean = (val != 0);
+        return 0;
+    }
+
     return -ENOENT;
 }
 
@@ -98,10 +128,36 @@ static void persist_markers(void)
 /* Recording state                                                     */
 /* ------------------------------------------------------------------ */
 
-int offline_rec_init(void)
+int offline_rec_init(uint8_t reset_code)
 {
-    LOG_INF("Offline recording: %s, %u marker(s) restored", rec_enabled ? "ENABLED" : "standby", marker_count);
+    last_reset_code = reset_code;
+
+    boot_count++;
+    uint16_t bc = boot_count;
+    int err = settings_save_one("pairent/boot_cnt", &bc, sizeof(bc));
+    if (err) {
+        LOG_ERR("Failed to persist boot_cnt: %d", err);
+    }
+
+    /* The flag on flash describes how the PREVIOUS run ended (set only by
+     * the power-off path). Consume and clear it so a freeze or battery
+     * death before the next clean power-off reads as unclean. */
+    uint8_t zero = 0;
+    (void) settings_save_one("pairent/clean_sd", &zero, sizeof(zero));
+
+    LOG_INF("Offline recording: %s, %u marker(s); boot #%u, reset code %u, prev shutdown %s",
+            rec_enabled ? "ENABLED" : "standby",
+            marker_count,
+            boot_count,
+            reset_code,
+            prev_shutdown_clean ? "clean" : "UNCLEAN");
     return 0;
+}
+
+void offline_rec_mark_clean_shutdown(void)
+{
+    uint8_t one = 1;
+    (void) settings_save_one("pairent/clean_sd", &one, sizeof(one));
 }
 
 bool offline_rec_enabled(void)
@@ -198,13 +254,17 @@ void offline_rec_get_status(uint8_t out[OFFLINE_REC_STATUS_LEN])
     uint32_t used = (used_bytes_cached > UINT32_MAX) ? UINT32_MAX : (uint32_t) used_bytes_cached;
     uint32_t free_bytes = (used < MAX_STORAGE_BYTES) ? (MAX_STORAGE_BYTES - used) : 0;
 
-    out[0] = 1; /* protocol version */
+    out[0] = 2; /* protocol version */
     out[1] = rec_enabled ? 1 : 0;
     out[2] = storage_state;
     out[3] = marker_count;
     put_le32(out + 4, used);
     put_le32(out + 8, free_bytes);
     put_le32(out + 12, get_utc_time());
+    out[16] = last_reset_code;
+    out[17] = boot_count & 0xFF;
+    out[18] = (boot_count >> 8) & 0xFF;
+    out[19] = prev_shutdown_clean ? 0x01 : 0x00;
 }
 
 static void evict_oldest_files(void)
