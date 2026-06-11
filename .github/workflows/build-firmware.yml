@@ -39,6 +39,10 @@ jobs:
         working-directory: omi-repo/omi/firmware/omi
         run: |
           cp omi.conf prj.conf
+          # Upstream committed a gitlink without a .gitmodules entry
+          # (omiGlass PlatformIO libdeps); checkout's post-job cleanup trips
+          # on it with a git exit-128 warning. Drop it from the index.
+          git -C "${{ github.workspace }}/omi-repo" rm -q --cached omiGlass/firmware/.pio/libdeps/seeed_xiao_esp32s3/libopus || true
           # mcuboot.conf symlink bug (OMI issue #6350) is fixed upstream;
           # sanity-check it is a regular file, not a symlink.
           if [ -L sysbuild/mcuboot.conf ]; then
