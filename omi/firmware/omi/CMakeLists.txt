@@ -14,6 +14,7 @@ file(GLOB app_sources
     src/spi_flash.c
     src/settings.c
     src/feedback.c
+    src/forensics.c
     src/wdog_facade.c
     src/rtc.c
     src/imu.c

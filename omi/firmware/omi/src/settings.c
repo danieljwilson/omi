@@ -207,6 +207,21 @@ int app_settings_init(void)
         LOG_ERR("Failed to load app settings (err %d)", err);
     }
 
+    /*
+     * The "pairent" subtree (boot counter, clean-shutdown flag, recording
+     * state, markers) must be in RAM before offline_rec_init() consumes it.
+     * Without this explicit load, the only full settings_load() lives in
+     * transport_start() behind CONFIG_BT_SETTINGS and runs AFTER
+     * offline_rec_init() — which pinned bootCount to 1 and
+     * prevShutdownClean to false on every boot (ISSUES #92 forensics gap),
+     * and silently broke marker/recording-state restoration whenever
+     * CONFIG_BT_SETTINGS is disabled.
+     */
+    int perr = settings_load_subtree("pairent");
+    if (perr && perr != -ENOENT) {
+        LOG_ERR("Failed to load pairent settings (err %d)", perr);
+    }
+
     LOG_INF("Settings initialized. dim_ratio=%u mic_gain=%u rtc_epoch=%llu lsm6_base_epoch=%llu lsm6_base_ts=0x%08x",
 		dim_light_ratio, mic_gain, rtc_epoch, lsm6dsl_time_base.epoch_s, lsm6dsl_time_base.ts);
     return (err == -ENOENT) ? 0 : err;

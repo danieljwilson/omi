@@ -12,6 +12,7 @@
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/sys/poweroff.h>
 
+#include "forensics.h"
 #include "haptic.h"
 #include "led.h"
 #include "mic.h"
@@ -174,7 +175,17 @@ void check_button_level(struct k_work *work_item)
 {
     current_time = current_time + 1;
 
-    u_int8_t btn_state = was_pressed ? BUTTON_PRESSED : BUTTON_RELEASED;
+    /* Poll the pin level directly instead of trusting the edge ISR: in the
+     * 2026-06-12 85-min freeze (ISSUES #92) this FSM provably kept running
+     * (sysworkq alive, WDT fed) yet buttons were dead — consistent with
+     * GPIO interrupt delivery dying. Polling keeps taps and long-press
+     * power-off working through that failure class; the ISR is kept only
+     * as a forensic edge counter. */
+    bool pressed_now = (gpio_pin_get_dt(&usr_btn) == 1);
+    forensics_button_level(pressed_now);
+    forensics_beat(FB_BUTTON_FSM);
+
+    u_int8_t btn_state = pressed_now ? BUTTON_PRESSED : BUTTON_RELEASED;
 
     ButtonEvent event = BUTTON_EVENT_NONE;
 
@@ -286,6 +297,7 @@ static struct gpio_callback button_cb_data;
 static void button_gpio_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
     was_pressed = (gpio_pin_get_dt(&usr_btn) == 1);
+    forensics_button_edge(was_pressed);
     LOG_INF("Button %s (GPIO callback)", was_pressed ? "pressed" : "released");
 }
 

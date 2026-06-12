@@ -2,6 +2,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/kernel.h>
 
+#include "forensics.h"
+
 LOG_MODULE_REGISTER(wdog_facade, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define WATCHDOG_TIMEOUT_MS CONFIG_OMI_WATCHDOG_TIMEOUT_MS
@@ -26,6 +28,7 @@ K_WORK_DELAYABLE_DEFINE(sysworkq_feed_work, sysworkq_feed_handler);
 static void sysworkq_feed_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
+    forensics_beat(FB_SYSWORKQ);
     if (wdt_dev && device_is_ready(wdt_dev) && wdt_channel_sysworkq >= 0) {
         wdt_feed(wdt_dev, wdt_channel_sysworkq);
     }
