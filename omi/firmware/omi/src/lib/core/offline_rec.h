@@ -18,7 +18,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define OFFLINE_REC_STATUS_LEN 20
+#include "forensics.h"
+
+/* v2 prefix (self-contained, served alone on pre-MTU-exchange notifies) +
+ * the pairent.4 wedge-forensics appendix. */
+#define OFFLINE_REC_STATUS_V2_LEN 20
+#define OFFLINE_REC_STATUS_LEN (OFFLINE_REC_STATUS_V2_LEN + FORENSICS_STATUS_APPENDIX_LEN)
 #define OFFLINE_REC_MAX_MARKERS 120
 
 /* Storage states reported in the status payload */
@@ -83,8 +88,8 @@ void offline_rec_clear_markers(void);
 uint8_t offline_rec_storage_state(void);
 
 /**
- * @brief Fill the 20-byte status payload (little-endian):
- *   [0]      protocol version (2)
+ * @brief Fill the 34-byte status payload (little-endian):
+ *   [0]      protocol version (3)
  *   [1]      recording enabled (0/1)
  *   [2]      storage state (OFFLINE_REC_STORAGE_*)
  *   [3]      marker count
@@ -94,6 +99,7 @@ uint8_t offline_rec_storage_state(void);
  *   [16]     reset-reason code of the current boot (see offline_rec_init)
  *   [17..18] boot count (u16, persisted; monotonic across reboots)
  *   [19]     flags: bit0 = previous shutdown was clean
+ *   [20..33] wedge-forensics appendix (see forensics.h)
  */
 void offline_rec_get_status(uint8_t out[OFFLINE_REC_STATUS_LEN]);
 

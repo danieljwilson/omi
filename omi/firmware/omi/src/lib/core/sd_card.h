@@ -291,6 +291,14 @@ void sd_off(void);
  */
 bool is_sd_on(void);
 
+/**
+ * @brief Whether SD boot init (mount, cleanup, allocator pre-warm) finished.
+ *
+ * The wedge supervisor's SD-stall check arms only after this — boot init
+ * legitimately runs minutes on a near-full card. ISR-safe (atomic read).
+ */
+bool sd_is_boot_ready(void);
+
 #endif // CONFIG_OMI_ENABLE_OFFLINE_STORAGE
 
 #endif // SD_CARD_H

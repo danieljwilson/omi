@@ -37,6 +37,13 @@ static uint8_t last_reset_code = 0;
 static uint16_t boot_count = 0;
 static bool prev_shutdown_clean = false;
 
+/* Snapshot taken in offline_rec_init, served by the status payload. With
+ * CONFIG_BT_SETTINGS the full settings_load() in transport_start() re-runs
+ * the pairent handler AFTER init has already consumed/zeroed the flash
+ * values; latching keeps the payload immune to that clobber. */
+static uint16_t boot_count_latched = 0;
+static bool prev_clean_latched = false;
+
 /* ------------------------------------------------------------------ */
 /* Persistence: dedicated "pairent" settings subtree                   */
 /* ------------------------------------------------------------------ */
@@ -132,6 +139,9 @@ int offline_rec_init(uint8_t reset_code)
 {
     last_reset_code = reset_code;
 
+    /* Requires app_settings_init() to have loaded the "pairent" subtree
+     * already — otherwise boot_count increments from 0 every boot and the
+     * payload is pinned to 1 (the pairent.3 forensics gap, ISSUES #92). */
     boot_count++;
     uint16_t bc = boot_count;
     int err = settings_save_one("pairent/boot_cnt", &bc, sizeof(bc));
@@ -144,6 +154,9 @@ int offline_rec_init(uint8_t reset_code)
      * death before the next clean power-off reads as unclean. */
     uint8_t zero = 0;
     (void) settings_save_one("pairent/clean_sd", &zero, sizeof(zero));
+
+    boot_count_latched = boot_count;
+    prev_clean_latched = prev_shutdown_clean;
 
     LOG_INF("Offline recording: %s, %u marker(s); boot #%u, reset code %u, prev shutdown %s",
             rec_enabled ? "ENABLED" : "standby",
@@ -254,7 +267,8 @@ void offline_rec_get_status(uint8_t out[OFFLINE_REC_STATUS_LEN])
     uint32_t used = (used_bytes_cached > UINT32_MAX) ? UINT32_MAX : (uint32_t) used_bytes_cached;
     uint32_t free_bytes = (used < MAX_STORAGE_BYTES) ? (MAX_STORAGE_BYTES - used) : 0;
 
-    out[0] = 2; /* protocol version */
+    out[0] = 3; /* protocol version (v3: wedge-forensics appendix; the app
+                 * gates on version >= 2 and tolerates appended bytes) */
     out[1] = rec_enabled ? 1 : 0;
     out[2] = storage_state;
     out[3] = marker_count;
@@ -262,9 +276,10 @@ void offline_rec_get_status(uint8_t out[OFFLINE_REC_STATUS_LEN])
     put_le32(out + 8, free_bytes);
     put_le32(out + 12, get_utc_time());
     out[16] = last_reset_code;
-    out[17] = boot_count & 0xFF;
-    out[18] = (boot_count >> 8) & 0xFF;
-    out[19] = prev_shutdown_clean ? 0x01 : 0x00;
+    out[17] = boot_count_latched & 0xFF;
+    out[18] = (boot_count_latched >> 8) & 0xFF;
+    out[19] = prev_clean_latched ? 0x01 : 0x00;
+    forensics_fill_status(out + OFFLINE_REC_STATUS_V2_LEN);
 }
 
 static void evict_oldest_files(void)

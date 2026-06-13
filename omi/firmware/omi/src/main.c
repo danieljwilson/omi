@@ -22,6 +22,7 @@
 #endif
 #include <hal/nrf_reset.h>
 
+#include "forensics.h"
 #include "imu.h"
 #include "lib/core/sd_card.h"
 #include "rtc.h"
@@ -87,6 +88,7 @@ static uint8_t print_reset_reason(void)
 
 static void codec_handler(uint8_t *data, size_t len)
 {
+    forensics_beat(FB_CODEC);
 #ifdef CONFIG_OMI_ENABLE_MONITOR
     monitor_inc_broadcast_audio();
 #endif
@@ -100,6 +102,9 @@ static void codec_handler(uint8_t *data, size_t len)
 
 static void mic_handler(int16_t *buffer)
 {
+    // Stamped before the AAD gate: this records PDM delivery, which AAD
+    // legitimately suspends in quiet rooms (hence never a reboot trigger)
+    forensics_beat(FB_MIC);
 #ifdef CONFIG_OMI_ENABLE_MONITOR
     // Track total bytes processed (each sample is 2 bytes)
     monitor_inc_mic_buffer();
@@ -111,6 +116,8 @@ static void mic_handler(int16_t *buffer)
     }
 #endif
 
+    // Past the AAD/VAD gate: this frame really enters the codec
+    forensics_beat(FB_CODEC_IN);
     int err = codec_receive_pcm(buffer, MIC_BUFFER_SAMPLES);
     if (err) {
         LOG_ERR("Failed to process PCM data: %d", err);
@@ -248,7 +255,10 @@ int main(void)
 
     // print reset reason at startup
     uint8_t reset_code = print_reset_reason();
-    (void) reset_code;
+
+    // Consume the previous life's wedge forensics before anything stamps a
+    // heartbeat (ISSUES #92)
+    forensics_boot(reset_code);
 
     // Initialize watchdog first to catch any early freezes
     ret = watchdog_init();
@@ -415,7 +425,11 @@ int main(void)
 
     LOG_INF("Device initialized successfully\n");
 
+    // Arm the wedge supervisor + netcore HCI probe (ISSUES #92)
+    forensics_start();
+
     while (1) {
+        forensics_beat(FB_MAIN_LOOP);
         watchdog_feed();
 #ifdef CONFIG_OMI_ENABLE_MONITOR
         monitor_log_metrics();

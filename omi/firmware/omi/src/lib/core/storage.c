@@ -12,6 +12,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 
+#include "forensics.h"
 #include "offline_rec.h"
 #include "sd_card.h"
 #include "transport.h"
@@ -746,6 +747,7 @@ void storage_write(void)
 
         // Pairent: storage stats refresh + oldest-file eviction + status
         // notify (self-throttled to one pass per 30 s inside).
+        forensics_beat(FB_STORAGE);
         offline_rec_housekeep();
 
         // Sleep when there's no work

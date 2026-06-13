@@ -12,6 +12,7 @@
  *   - SD card has internal wear leveling â†’ block_cycles = -1
  */
 #include "lib/core/sd_card.h"
+#include "forensics.h"
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
 #include "lib/core/offline_rec.h"
 #endif
@@ -106,6 +107,12 @@ static uint8_t _lfs_io_tmp[512];
 static int lfs_disk_read_cb(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, void *buffer, lfs_size_t size)
 {
     (void) c;
+    /* Heartbeat per block-device op: littlefs allocator scans (boot
+     * lfs_fs_gc and every lookahead-window refill) legitimately run for
+     * minutes at the ~450 MB eviction steady state inside ONE lfs call —
+     * a progressing scan keeps issuing reads, a true SPI/SD wedge stops.
+     * LFS use is worker-thread-confined, so this stamps the right slot. */
+    forensics_beat(FB_SD_WORKER);
     uint32_t sector = (uint32_t) block * SECTORS_PER_BLOCK + off / DISK_SECTOR_SIZE;
     uint32_t sec_off = off % DISK_SECTOR_SIZE;
 
@@ -135,6 +142,7 @@ static int
 lfs_disk_prog_cb(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, const void *buffer, lfs_size_t size)
 {
     (void) c;
+    forensics_beat(FB_SD_WORKER);
     uint32_t sector = (uint32_t) block * SECTORS_PER_BLOCK + off / DISK_SECTOR_SIZE;
     uint32_t sec_off = off % DISK_SECTOR_SIZE;
 
@@ -1319,6 +1327,9 @@ void sd_worker_thread(void)
     }
 
     /* ---- SD boot init complete, allow writes ---- */
+    /* Fresh heartbeat seed: the supervisor's SD-stall check arms only once
+     * sd_boot_ready is set, and must not inherit a stamp from early boot. */
+    forensics_beat(FB_SD_WORKER);
     atomic_set(&sd_boot_ready, 1);
     LOG_INF("[SD_BOOT] SD card ready for audio writes (boot took %lld ms)", k_uptime_get());
 
@@ -1328,6 +1339,11 @@ void sd_worker_thread(void)
 
     /* ---- Main loop ---- */
     while (1) {
+        /* This loop turns at least every 2 s when idle (bounded msgq waits
+         * below), so a stale heartbeat means the worker is stuck inside an
+         * LFS/SPI call. */
+        forensics_beat(FB_SD_WORKER);
+
         /* Handle deferred control requests first (when queue was saturated). */
         if (atomic_cas(&pending_flush_on_ble_connect, 1, 0)) {
             req.type = REQ_FLUSH_FILE;
@@ -1728,6 +1744,11 @@ int app_sd_off(void)
 bool is_sd_on(void)
 {
     return sd_enabled;
+}
+
+bool sd_is_boot_ready(void)
+{
+    return atomic_get(&sd_boot_ready) != 0;
 }
 
 uint32_t get_file_size(void)

@@ -24,6 +24,7 @@
 #include "button.h"
 #include "config.h"
 #include "features.h"
+#include "forensics.h"
 #include "haptic.h"
 #include "led.h"
 #include "mic.h"
@@ -766,7 +767,8 @@ static ssize_t led_control_write_handler(struct bt_conn *conn,
 
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
 // --- Offline recording control/status characteristic (19B10007) ---
-// Read/notify: 16-byte status payload (see offline_rec_get_status).
+// Read/notify: status payload v3, 34 bytes = 20-byte v2 prefix + 14-byte
+// wedge-forensics appendix (see offline_rec_get_status / forensics_fill_status).
 // Write: 0x00 = stop recording, 0x01 = start recording, 0x02 = clear markers.
 
 static const struct bt_gatt_attr *offline_ctrl_attr(void)
@@ -791,7 +793,12 @@ void transport_notify_offline_status(void)
 
     uint8_t status[OFFLINE_REC_STATUS_LEN];
     offline_rec_get_status(status);
-    bt_gatt_notify(conn, attr, status, sizeof(status));
+    /* Before the MTU exchange (ATT MTU 23) a notify carries at most 20
+     * bytes. The v2 prefix is self-contained, so fall back to it rather
+     * than losing the notify-on-subscribe data-ready signal entirely. */
+    uint16_t mtu = bt_gatt_get_mtu(conn);
+    uint16_t len = (mtu >= sizeof(status) + 3) ? sizeof(status) : OFFLINE_REC_STATUS_V2_LEN;
+    bt_gatt_notify(conn, attr, status, len);
 }
 
 static ssize_t offline_ctrl_read_handler(struct bt_conn *conn,
@@ -1414,6 +1421,12 @@ void pusher(void)
         }
 
         while (read_from_tx_queue()) {
+            /* Stamped per consumed frame: if this freezes while the codec
+             * heartbeat keeps advancing, the pusher is parked (e.g. in
+             * push_to_gatt's K_FOREVER audio_tx_sem wait, the ISSUES #92
+             * wedge signature) and the supervisor reboots with cause
+             * FCAUSE_PUSHER_STALL. */
+            forensics_beat(FB_PUSHER);
             struct bt_conn *conn = current_connection;
             bool is_subscribed = false;
             if (conn) {
@@ -1540,6 +1553,9 @@ int transport_start()
     if (err) {
         LOG_WRN("Continuing without confirmed BLE identity (err %d)", err);
     }
+
+    // Host is up: arm the netcore HCI liveness probe (ISSUES #92)
+    forensics_bt_ready();
 
     // Production-line helper: emit local BLE addresses on UART for fixture parsing.
     log_local_ble_addresses();
