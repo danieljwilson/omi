@@ -2,7 +2,15 @@ name: Build OMI Firmware (offline-recording)
 
 on:
   push:
-    branches: [offline-recording]
+    branches:
+      - offline-recording
+      - 'wedge-forensics-*'
+    paths:
+      - 'omi/firmware/**'
+      - '.github/workflows/build-firmware.yml'
+  # Gate any firmware-touching PR (incl. the merge of a pairent.N branch back
+  # into offline-recording) so the netcore-config check below can't be skipped.
+  pull_request:
     paths:
       - 'omi/firmware/**'
       - '.github/workflows/build-firmware.yml'
