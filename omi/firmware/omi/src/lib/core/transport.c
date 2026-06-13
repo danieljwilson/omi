@@ -797,7 +797,17 @@ void transport_notify_offline_status(void)
      * bytes. The v2 prefix is self-contained, so fall back to it rather
      * than losing the notify-on-subscribe data-ready signal entirely. */
     uint16_t mtu = bt_gatt_get_mtu(conn);
-    uint16_t len = (mtu >= sizeof(status) + 3) ? sizeof(status) : OFFLINE_REC_STATUS_V2_LEN;
+    uint16_t len;
+    if (mtu >= sizeof(status) + 3) {
+        len = sizeof(status);
+    } else {
+        /* Truncated to the v2 prefix: the v3 appendix (bytes 20..33) is not
+         * sent, so downgrade the version byte to 2 to match the bytes on the
+         * wire. Otherwise a parser keying on the version sees v3 with no
+         * appendix and over-reads / rejects the notify. */
+        len = OFFLINE_REC_STATUS_V2_LEN;
+        status[0] = 2;
+    }
     bt_gatt_notify(conn, attr, status, len);
 }
 
