@@ -513,24 +513,37 @@ static ssize_t storage_write_handler(struct bt_conn *conn,
  * Only need a small separate buffer for building BLE notifications.
  */
 #define BLE_BATCH_PACKETS 20
+/* H3: per-episode ceiling on the -ENOMEM busy-spin in write_to_gatt_inner. This
+ * is NOT a reboot guard — the supervisor's SD_STALL watches FB_SD_WORKER (a
+ * separate thread), not FB_STORAGE, so an unbounded spin here would not trip it.
+ * The point is to bound a CPU busy-spin so the drain thread yields and returns
+ * to its loop to keep servicing CMD_STOP_SYNC / housekeeping. The deadline
+ * resets on progress, so it caps each stall episode, not the whole drain. */
+#define WRITE_GATT_ENOMEM_DEADLINE_MS 4000
 static uint8_t ble_notify_buf[4 + SD_BLE_SIZE];
 
-static void write_to_gatt(struct bt_conn *conn)
+static void write_to_gatt_inner(struct bt_conn *conn)
 {
     int err;
+    int64_t enomem_deadline = 0;  /* H3: 0 = not currently in an -ENOMEM stall */
     if (sync_speed_mode != SYNC_SPEED_MODE_BLE) {
         sync_speed_reset(SYNC_SPEED_MODE_BLE);
     }
-    uint16_t ble_chunk = get_ble_chunk_size(conn, current_sync_file_index >= 0);
+    /* CONC-1: snapshot the index — a concurrent disconnect (H5 storage_stop_transfer)
+     * can set current_sync_file_index to -1 between the guard and the subscript
+     * below; using a local avoids a sync_file_list[-1] read. The torn-down
+     * transfer's header is discarded anyway (the same stop sets remaining_length=0). */
+    int file_idx = current_sync_file_index;
+    uint16_t ble_chunk = get_ble_chunk_size(conn, file_idx >= 0);
     
-    if (current_sync_file_index < 0) {
+    if (file_idx < 0) {
         LOG_ERR("write_to_gatt called without active multi-file transfer");
         remaining_length = 0;
         return;
     }
 
     /* New protocol: add 4-byte timestamp prefix */
-    uint32_t timestamp = (uint32_t)strtoul(sync_file_list[current_sync_file_index], NULL, 16);
+    uint32_t timestamp = (uint32_t)strtoul(sync_file_list[file_idx], NULL, 16);
         
         /* Build timestamp header once */
         ble_notify_buf[0] = (timestamp >> 24) & 0xFF;
@@ -581,6 +594,19 @@ static void write_to_gatt(struct bt_conn *conn)
                         remaining_length = 0;
                         return;
                     }
+                    /* H3: bound the per-episode busy-spin so this drain thread
+                     * yields and returns to its loop instead of spinning on a
+                     * persistently full BLE TX buffer. (Not a reboot guard:
+                     * SD_STALL is gated on FB_SD_WORKER, a different thread.) */
+                    if (enomem_deadline == 0) {
+                        enomem_deadline = k_uptime_get() + WRITE_GATT_ENOMEM_DEADLINE_MS;
+                    } else if (k_uptime_get() > enomem_deadline) {
+                        LOG_ERR("BLE notify -ENOMEM persisted > %d ms, aborting drain",
+                                WRITE_GATT_ENOMEM_DEADLINE_MS);
+                        transfer_end_status = STORAGE_NOT_READY;
+                        remaining_length = 0;
+                        return;
+                    }
                     k_yield();
                     continue;
                 }
@@ -596,14 +622,38 @@ static void write_to_gatt(struct bt_conn *conn)
                 sync_speed_add_bytes(chunk);
                 current_read_offset += chunk;
                 remaining_length -= chunk;
+                enomem_deadline = 0;  /* H3: progress made; reset the stall deadline */
             }
         }
+}
+
+/* H2: take a ref for the whole (multi-second) drain. storage_write passes
+ * current_connection without one; a peer disconnect unrefs+NULLs it under
+ * write_to_gatt_inner's loop, which would otherwise notify a recycled conn.
+ * This wrapper keeps a single ref/unref pair around every inner exit path. */
+static void write_to_gatt(struct bt_conn *conn)
+{
+    if (conn == NULL) {
+        remaining_length = 0;
+        return;
+    }
+    conn = bt_conn_ref(conn);
+    write_to_gatt_inner(conn);
+    bt_conn_unref(conn);
 }
 
 void storage_stop_transfer()
 {
     remaining_length = 0;
     stop_started = 1;
+    /* H5: also clear the rest of the transfer state. storage_stop_transfer is
+     * now called from _transport_disconnected too, so a mid-drain disconnect
+     * must not leave current_sync_file_index / sync_speed_mode dirty (which
+     * spuriously aborts the next sync). The storage thread tolerates these
+     * being reset here — its post-transfer cleanup re-clears the same fields. */
+    current_sync_file_index = -1;
+    transport_started = 0;
+    sync_speed_mode = SYNC_SPEED_MODE_NONE;
 }
 
 bool storage_transfer_active(void)

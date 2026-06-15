@@ -50,6 +50,12 @@ extern bool storage_is_on;
 static bool storage_full_warned = false;
 #endif
 
+// Lever 4A: whether we intend to be advertising. Set when transport_start arms
+// the advertiser, cleared at the top of transport_off. The .recycled callback
+// only re-arms advertising when this is true, so a deliberate shutdown doesn't
+// race the teardown.
+static bool advertising_intended = false;
+
 extern bool is_connected;
 extern bool led_app_override;
 extern uint8_t led_app_color;
@@ -57,6 +63,11 @@ extern uint8_t led_app_color;
 extern bool is_charging;
 #endif
 static atomic_t pusher_stop_flag;
+// Lever 1: latched once when the audio_tx_sem wait times out (netcore
+// TX-completion-loss wedge), so we issue exactly one link teardown and skip the
+// BLE leg until the link recycles while SD keeps capturing. Cleared in
+// _transport_connected / _transport_disconnected.
+static atomic_t ble_tx_stalled = ATOMIC_INIT(0);
 
 struct bt_conn *current_connection = NULL;
 uint16_t current_mtu = 0;
@@ -670,8 +681,10 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
 
     err = bt_conn_get_info(conn, &info);
     if (err) {
+        // H1: the connected callback receives a borrowed conn — the BLE stack
+        // owns the reference until we take our own (bt_conn_ref below). Unref'ing
+        // here drops a ref we never held and underflows the refcount. Just log.
         LOG_ERR("Failed to get connection info (err %d)", err);
-        bt_conn_unref(conn);
         return;
     }
 
@@ -708,6 +721,7 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
     schedule_mtu_recheck();
 
     is_connected = true;
+    atomic_clear(&ble_tx_stalled);  // Lever 1: fresh link, re-enable the BLE leg
 
     if (IS_ENABLED(CONFIG_SHELL_BT_NUS)) {
         shell_bt_nus_enable(conn);
@@ -729,6 +743,17 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
 K_SEM_DEFINE(audio_tx_sem,
              CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS,
              CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS);
+
+// Lever 1: bound the audio_tx_sem wait so a netcore TX-completion-loss wedge
+// can't park the pusher forever (which would also stall SD capture, since the
+// pusher serializes SD-then-BLE per frame). 5 s is far above normal sub-second
+// slot refill, so it only fires on a genuine stall. On a truly dead link
+// recovery is belt-and-suspenders: either the controller's supervision timeout
+// (we request 4 s via update_conn_params; the central may grant longer) fires
+// _transport_disconnected first, or this teardown does — both re-init the sem
+// and clear the latch.
+#define BLE_TX_SEM_TIMEOUT_S 5
+#define BLE_TX_SEM_TIMEOUT   K_SECONDS(BLE_TX_SEM_TIMEOUT_S)
 
 // --- LED control characteristic write handler ---
 // App writes 0x00 = blue (idle), 0x01 = green (recording)
@@ -895,13 +920,22 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
     sd_notify_ble_state(false);
     storage_is_on = false;
+    // H5: storage_stop_transfer was only wired to CMD_STOP_SYNC, so a mid-drain
+    // disconnect left the transfer state dirty (spurious abort on the next sync)
+    // and the storage drain loop could keep notifying the conn we unref just
+    // below. Tear the transfer down so the stop_started checks fire immediately.
+    storage_stop_transfer();
 #endif
 
     LOG_INF("Transport disconnected");
 
-    if (current_connection != NULL) {
-        bt_conn_unref(current_connection);
-        current_connection = NULL;
+    // H4: publish the NULL before dropping the ref so concurrent readers
+    // (pusher's current_connection read, storage drain, status notifiers) never
+    // observe a pointer whose refcount we just released. Unref the local copy.
+    struct bt_conn *disconnected = current_connection;
+    current_connection = NULL;
+    if (disconnected != NULL) {
+        bt_conn_unref(disconnected);
     }
     current_mtu = 0;
     charging_status_last_notified = -1;
@@ -911,6 +945,7 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
     k_sem_init(&audio_tx_sem,
                CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS,
                CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS);
+    atomic_clear(&ble_tx_stalled);  // Lever 1: link is gone, clear the one-shot latch
 }
 
 static bool _le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
@@ -968,9 +1003,29 @@ static void _le_data_length_updated(struct bt_conn *conn, struct bt_conn_le_data
     }
 }
 
+// Lever 4A: the peripheral advertiser is started once in transport_start and is
+// NOT restarted on disconnect — Zephyr's auto-resume is the only thing that
+// re-arms it, and if that ever fails nothing notices and the device goes
+// silently unreachable (no reconnect). .recycled fires once a disconnected conn
+// object is freed and an advertising slot is available again; re-arm here.
+// -EALREADY just means it is already advertising (healthy), not an error.
+static void _transport_recycled(void)
+{
+    if (!advertising_intended) {
+        return;  // deliberate shutdown (transport_off / power down)
+    }
+    int err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
+    if (err && err != -EALREADY) {
+        LOG_ERR("Re-advertise on conn recycle failed (err %d)", err);
+    } else {
+        LOG_INF("Advertising re-armed after connection recycle");
+    }
+}
+
 static struct bt_conn_cb _callback_references = {
     .connected = _transport_connected,
     .disconnected = _transport_disconnected,
+    .recycled = _transport_recycled,
     .le_param_req = _le_param_req,
     .le_param_updated = _le_param_updated,
     .le_phy_updated = _le_phy_updated,
@@ -1273,6 +1328,13 @@ static uint8_t pusher_temp_data[MAX_POSSIBLE_MTU];
 
 static bool push_to_gatt(struct bt_conn *conn)
 {
+    // Lever 1: if a prior frame already detected a TX-completion stall and
+    // issued the one-shot teardown, skip the BLE leg until the link recycles.
+    // The pusher loop still stores every frame to SD first, so capture continues.
+    if (atomic_get(&ble_tx_stalled)) {
+        return false;
+    }
+
     uint8_t *buffer = tx_buffer + RING_BUFFER_HEADER_SIZE;
     uint32_t offset = 0;
     uint8_t index = 0;
@@ -1282,10 +1344,28 @@ static bool push_to_gatt(struct bt_conn *conn)
     while (offset < tx_buffer_size) {
         uint32_t packet_size = MIN(current_mtu - NET_BUFFER_HEADER_SIZE, tx_buffer_size - offset);
 
-        // Block until a throttle slot is available. This preserves every audio
-        // packet while still guaranteeing AUDIO_TX_RESERVED_SLOTS remain free
-        // for battery/diagnostic/status notifications at all times.
-        k_sem_take(&audio_tx_sem, K_FOREVER);
+        // Lever 1: bounded wait. On timeout the netcore has almost certainly
+        // wedged (TX completions stopped refilling the sem); drop this frame's
+        // BLE leg and tear the link down ONCE so the host re-inits audio_tx_sem
+        // cleanly (via _transport_disconnected) and the phone can reconnect into
+        // a healthy link. Do NOT k_sem_give — no slot was acquired. SD capture
+        // is unaffected: the pusher already stored this frame before calling us.
+        if (k_sem_take(&audio_tx_sem, BLE_TX_SEM_TIMEOUT) != 0) {
+            if (atomic_cas(&ble_tx_stalled, 0, 1)) {
+                LOG_ERR("audio_tx_sem stalled >%d s; dropping BLE, keeping SD, tearing down link",
+                        BLE_TX_SEM_TIMEOUT_S);
+                // The caller (pusher) owns the conn ref; bt_conn_disconnect does
+                // not consume it, so no ref/unref is needed here. If the terminate
+                // can't even be queued (e.g. transient -ENOBUFS) the link may
+                // survive and no .disconnected fires to clear the latch — so
+                // un-latch on failure and let the next frame retry, otherwise the
+                // BLE leg would stay suppressed for the rest of a live connection.
+                if (bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN) != 0) {
+                    atomic_clear(&ble_tx_stalled);
+                }
+            }
+            return false;
+        }
 
         uint32_t id = packet_next_index++;
         pusher_temp_data[0] = id & 0xFF;
@@ -1431,11 +1511,13 @@ void pusher(void)
         }
 
         while (read_from_tx_queue()) {
-            /* Stamped per consumed frame: if this freezes while the codec
-             * heartbeat keeps advancing, the pusher is parked (e.g. in
-             * push_to_gatt's K_FOREVER audio_tx_sem wait, the ISSUES #92
-             * wedge signature) and the supervisor reboots with cause
-             * FCAUSE_PUSHER_STALL. */
+            /* Stamped per consumed frame. push_to_gatt's audio_tx_sem wait is
+             * now bounded (Lever 1): on a netcore TX-completion-loss wedge it
+             * times out, drops the BLE leg, tears the link down, and keeps
+             * consuming frames — so this keeps beating and FCAUSE_PUSHER_STALL
+             * no longer fires for that mode (we degrade to SD-only instead of
+             * rebooting). The supervisor threshold stays as a backstop for a
+             * TRUE pusher hang (e.g. inside write_to_storage's msgq). */
             forensics_beat(FB_PUSHER);
             struct bt_conn *conn = current_connection;
             bool is_subscribed = false;
@@ -1481,6 +1563,8 @@ void pusher(void)
 
 int transport_off()
 {
+    advertising_intended = false;  // Lever 4A: prevent .recycled re-arming during teardown
+
     // Stop pusher thread when transport is turned off
     atomic_set(&pusher_stop_flag, 1);
     k_sem_give(&tx_queue_sem);
@@ -1625,6 +1709,7 @@ int transport_start()
     memset(storage_temp_data, 0, OPUS_PADDED_LENGTH * 4);
     bt_gatt_service_register(&storage_service);
 #endif
+    advertising_intended = true;  // Lever 4A: we intend to advertise from here on
     err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
     if (err) {
         LOG_ERR("Transport advertising failed to start (err %d), continuing without BLE", err);
