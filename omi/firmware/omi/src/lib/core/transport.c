@@ -746,9 +746,12 @@ K_SEM_DEFINE(audio_tx_sem,
 
 // Lever 1: bound the audio_tx_sem wait so a netcore TX-completion-loss wedge
 // can't park the pusher forever (which would also stall SD capture, since the
-// pusher serializes SD-then-BLE per frame). 5 s sits just under the ~6 s conn
-// supervision timeout, so our clean teardown runs before the stack would
-// declare the link dead. Far above normal sub-second slot refill.
+// pusher serializes SD-then-BLE per frame). 5 s is far above normal sub-second
+// slot refill, so it only fires on a genuine stall. On a truly dead link
+// recovery is belt-and-suspenders: either the controller's supervision timeout
+// (we request 4 s via update_conn_params; the central may grant longer) fires
+// _transport_disconnected first, or this teardown does — both re-init the sem
+// and clear the latch.
 #define BLE_TX_SEM_TIMEOUT_S 5
 #define BLE_TX_SEM_TIMEOUT   K_SECONDS(BLE_TX_SEM_TIMEOUT_S)
 
@@ -1352,8 +1355,14 @@ static bool push_to_gatt(struct bt_conn *conn)
                 LOG_ERR("audio_tx_sem stalled >%d s; dropping BLE, keeping SD, tearing down link",
                         BLE_TX_SEM_TIMEOUT_S);
                 // The caller (pusher) owns the conn ref; bt_conn_disconnect does
-                // not consume it, so no ref/unref is needed here.
-                bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+                // not consume it, so no ref/unref is needed here. If the terminate
+                // can't even be queued (e.g. transient -ENOBUFS) the link may
+                // survive and no .disconnected fires to clear the latch — so
+                // un-latch on failure and let the next frame retry, otherwise the
+                // BLE leg would stay suppressed for the rest of a live connection.
+                if (bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN) != 0) {
+                    atomic_clear(&ble_tx_stalled);
+                }
             }
             return false;
         }

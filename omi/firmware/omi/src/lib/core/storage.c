@@ -513,10 +513,12 @@ static ssize_t storage_write_handler(struct bt_conn *conn,
  * Only need a small separate buffer for building BLE notifications.
  */
 #define BLE_BATCH_PACKETS 20
-/* H3: hard ceiling on the -ENOMEM busy-spin in write_to_gatt. Must stay well
- * below the forensics SD_STALL / FB_STORAGE supervisor threshold (120 s), since
- * FB_STORAGE is only beaten after write_to_gatt returns — an unbounded spin
- * here would starve the heartbeat into a spurious supervisor reboot. */
+/* H3: per-episode ceiling on the -ENOMEM busy-spin in write_to_gatt_inner. This
+ * is NOT a reboot guard — the supervisor's SD_STALL watches FB_SD_WORKER (a
+ * separate thread), not FB_STORAGE, so an unbounded spin here would not trip it.
+ * The point is to bound a CPU busy-spin so the drain thread yields and returns
+ * to its loop to keep servicing CMD_STOP_SYNC / housekeeping. The deadline
+ * resets on progress, so it caps each stall episode, not the whole drain. */
 #define WRITE_GATT_ENOMEM_DEADLINE_MS 4000
 static uint8_t ble_notify_buf[4 + SD_BLE_SIZE];
 
@@ -527,16 +529,21 @@ static void write_to_gatt_inner(struct bt_conn *conn)
     if (sync_speed_mode != SYNC_SPEED_MODE_BLE) {
         sync_speed_reset(SYNC_SPEED_MODE_BLE);
     }
-    uint16_t ble_chunk = get_ble_chunk_size(conn, current_sync_file_index >= 0);
+    /* CONC-1: snapshot the index — a concurrent disconnect (H5 storage_stop_transfer)
+     * can set current_sync_file_index to -1 between the guard and the subscript
+     * below; using a local avoids a sync_file_list[-1] read. The torn-down
+     * transfer's header is discarded anyway (the same stop sets remaining_length=0). */
+    int file_idx = current_sync_file_index;
+    uint16_t ble_chunk = get_ble_chunk_size(conn, file_idx >= 0);
     
-    if (current_sync_file_index < 0) {
+    if (file_idx < 0) {
         LOG_ERR("write_to_gatt called without active multi-file transfer");
         remaining_length = 0;
         return;
     }
 
     /* New protocol: add 4-byte timestamp prefix */
-    uint32_t timestamp = (uint32_t)strtoul(sync_file_list[current_sync_file_index], NULL, 16);
+    uint32_t timestamp = (uint32_t)strtoul(sync_file_list[file_idx], NULL, 16);
         
         /* Build timestamp header once */
         ble_notify_buf[0] = (timestamp >> 24) & 0xFF;
@@ -587,10 +594,10 @@ static void write_to_gatt_inner(struct bt_conn *conn)
                         remaining_length = 0;
                         return;
                     }
-                    /* H3: bound the busy-spin. FB_STORAGE is only beaten after
-                     * write_to_gatt returns, so an unbounded -ENOMEM spin would
-                     * starve the heartbeat into a supervisor SD_STALL reboot
-                     * (120 s). Abort the drain well below that threshold. */
+                    /* H3: bound the per-episode busy-spin so this drain thread
+                     * yields and returns to its loop instead of spinning on a
+                     * persistently full BLE TX buffer. (Not a reboot guard:
+                     * SD_STALL is gated on FB_SD_WORKER, a different thread.) */
                     if (enomem_deadline == 0) {
                         enomem_deadline = k_uptime_get() + WRITE_GATT_ENOMEM_DEADLINE_MS;
                     } else if (k_uptime_get() > enomem_deadline) {
