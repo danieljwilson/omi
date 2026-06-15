@@ -50,6 +50,12 @@ extern bool storage_is_on;
 static bool storage_full_warned = false;
 #endif
 
+// Lever 4A: whether we intend to be advertising. Set when transport_start arms
+// the advertiser, cleared at the top of transport_off. The .recycled callback
+// only re-arms advertising when this is true, so a deliberate shutdown doesn't
+// race the teardown.
+static bool advertising_intended = false;
+
 extern bool is_connected;
 extern bool led_app_override;
 extern uint8_t led_app_color;
@@ -994,9 +1000,29 @@ static void _le_data_length_updated(struct bt_conn *conn, struct bt_conn_le_data
     }
 }
 
+// Lever 4A: the peripheral advertiser is started once in transport_start and is
+// NOT restarted on disconnect — Zephyr's auto-resume is the only thing that
+// re-arms it, and if that ever fails nothing notices and the device goes
+// silently unreachable (no reconnect). .recycled fires once a disconnected conn
+// object is freed and an advertising slot is available again; re-arm here.
+// -EALREADY just means it is already advertising (healthy), not an error.
+static void _transport_recycled(void)
+{
+    if (!advertising_intended) {
+        return;  // deliberate shutdown (transport_off / power down)
+    }
+    int err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
+    if (err && err != -EALREADY) {
+        LOG_ERR("Re-advertise on conn recycle failed (err %d)", err);
+    } else {
+        LOG_INF("Advertising re-armed after connection recycle");
+    }
+}
+
 static struct bt_conn_cb _callback_references = {
     .connected = _transport_connected,
     .disconnected = _transport_disconnected,
+    .recycled = _transport_recycled,
     .le_param_req = _le_param_req,
     .le_param_updated = _le_param_updated,
     .le_phy_updated = _le_phy_updated,
@@ -1528,6 +1554,8 @@ void pusher(void)
 
 int transport_off()
 {
+    advertising_intended = false;  // Lever 4A: prevent .recycled re-arming during teardown
+
     // Stop pusher thread when transport is turned off
     atomic_set(&pusher_stop_flag, 1);
     k_sem_give(&tx_queue_sem);
@@ -1672,6 +1700,7 @@ int transport_start()
     memset(storage_temp_data, 0, OPUS_PADDED_LENGTH * 4);
     bt_gatt_service_register(&storage_service);
 #endif
+    advertising_intended = true;  // Lever 4A: we intend to advertise from here on
     err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
     if (err) {
         LOG_ERR("Transport advertising failed to start (err %d), continuing without BLE", err);
