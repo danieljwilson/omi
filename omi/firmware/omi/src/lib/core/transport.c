@@ -57,6 +57,11 @@ extern uint8_t led_app_color;
 extern bool is_charging;
 #endif
 static atomic_t pusher_stop_flag;
+// Lever 1: latched once when the audio_tx_sem wait times out (netcore
+// TX-completion-loss wedge), so we issue exactly one link teardown and skip the
+// BLE leg until the link recycles while SD keeps capturing. Cleared in
+// _transport_connected / _transport_disconnected.
+static atomic_t ble_tx_stalled = ATOMIC_INIT(0);
 
 struct bt_conn *current_connection = NULL;
 uint16_t current_mtu = 0;
@@ -710,6 +715,7 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
     schedule_mtu_recheck();
 
     is_connected = true;
+    atomic_clear(&ble_tx_stalled);  // Lever 1: fresh link, re-enable the BLE leg
 
     if (IS_ENABLED(CONFIG_SHELL_BT_NUS)) {
         shell_bt_nus_enable(conn);
@@ -731,6 +737,14 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
 K_SEM_DEFINE(audio_tx_sem,
              CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS,
              CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS);
+
+// Lever 1: bound the audio_tx_sem wait so a netcore TX-completion-loss wedge
+// can't park the pusher forever (which would also stall SD capture, since the
+// pusher serializes SD-then-BLE per frame). 5 s sits just under the ~6 s conn
+// supervision timeout, so our clean teardown runs before the stack would
+// declare the link dead. Far above normal sub-second slot refill.
+#define BLE_TX_SEM_TIMEOUT_S 5
+#define BLE_TX_SEM_TIMEOUT   K_SECONDS(BLE_TX_SEM_TIMEOUT_S)
 
 // --- LED control characteristic write handler ---
 // App writes 0x00 = blue (idle), 0x01 = green (recording)
@@ -922,6 +936,7 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
     k_sem_init(&audio_tx_sem,
                CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS,
                CONFIG_BT_CONN_TX_MAX - AUDIO_TX_RESERVED_SLOTS);
+    atomic_clear(&ble_tx_stalled);  // Lever 1: link is gone, clear the one-shot latch
 }
 
 static bool _le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
@@ -1284,6 +1299,13 @@ static uint8_t pusher_temp_data[MAX_POSSIBLE_MTU];
 
 static bool push_to_gatt(struct bt_conn *conn)
 {
+    // Lever 1: if a prior frame already detected a TX-completion stall and
+    // issued the one-shot teardown, skip the BLE leg until the link recycles.
+    // The pusher loop still stores every frame to SD first, so capture continues.
+    if (atomic_get(&ble_tx_stalled)) {
+        return false;
+    }
+
     uint8_t *buffer = tx_buffer + RING_BUFFER_HEADER_SIZE;
     uint32_t offset = 0;
     uint8_t index = 0;
@@ -1293,10 +1315,22 @@ static bool push_to_gatt(struct bt_conn *conn)
     while (offset < tx_buffer_size) {
         uint32_t packet_size = MIN(current_mtu - NET_BUFFER_HEADER_SIZE, tx_buffer_size - offset);
 
-        // Block until a throttle slot is available. This preserves every audio
-        // packet while still guaranteeing AUDIO_TX_RESERVED_SLOTS remain free
-        // for battery/diagnostic/status notifications at all times.
-        k_sem_take(&audio_tx_sem, K_FOREVER);
+        // Lever 1: bounded wait. On timeout the netcore has almost certainly
+        // wedged (TX completions stopped refilling the sem); drop this frame's
+        // BLE leg and tear the link down ONCE so the host re-inits audio_tx_sem
+        // cleanly (via _transport_disconnected) and the phone can reconnect into
+        // a healthy link. Do NOT k_sem_give — no slot was acquired. SD capture
+        // is unaffected: the pusher already stored this frame before calling us.
+        if (k_sem_take(&audio_tx_sem, BLE_TX_SEM_TIMEOUT) != 0) {
+            if (atomic_cas(&ble_tx_stalled, 0, 1)) {
+                LOG_ERR("audio_tx_sem stalled >%d s; dropping BLE, keeping SD, tearing down link",
+                        BLE_TX_SEM_TIMEOUT_S);
+                // The caller (pusher) owns the conn ref; bt_conn_disconnect does
+                // not consume it, so no ref/unref is needed here.
+                bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+            }
+            return false;
+        }
 
         uint32_t id = packet_next_index++;
         pusher_temp_data[0] = id & 0xFF;
@@ -1442,11 +1476,13 @@ void pusher(void)
         }
 
         while (read_from_tx_queue()) {
-            /* Stamped per consumed frame: if this freezes while the codec
-             * heartbeat keeps advancing, the pusher is parked (e.g. in
-             * push_to_gatt's K_FOREVER audio_tx_sem wait, the ISSUES #92
-             * wedge signature) and the supervisor reboots with cause
-             * FCAUSE_PUSHER_STALL. */
+            /* Stamped per consumed frame. push_to_gatt's audio_tx_sem wait is
+             * now bounded (Lever 1): on a netcore TX-completion-loss wedge it
+             * times out, drops the BLE leg, tears the link down, and keeps
+             * consuming frames — so this keeps beating and FCAUSE_PUSHER_STALL
+             * no longer fires for that mode (we degrade to SD-only instead of
+             * rebooting). The supervisor threshold stays as a backstop for a
+             * TRUE pusher hang (e.g. inside write_to_storage's msgq). */
             forensics_beat(FB_PUSHER);
             struct bt_conn *conn = current_connection;
             bool is_subscribed = false;
