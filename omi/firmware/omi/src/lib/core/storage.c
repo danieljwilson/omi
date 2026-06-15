@@ -513,11 +513,17 @@ static ssize_t storage_write_handler(struct bt_conn *conn,
  * Only need a small separate buffer for building BLE notifications.
  */
 #define BLE_BATCH_PACKETS 20
+/* H3: hard ceiling on the -ENOMEM busy-spin in write_to_gatt. Must stay well
+ * below the forensics SD_STALL / FB_STORAGE supervisor threshold (120 s), since
+ * FB_STORAGE is only beaten after write_to_gatt returns — an unbounded spin
+ * here would starve the heartbeat into a spurious supervisor reboot. */
+#define WRITE_GATT_ENOMEM_DEADLINE_MS 4000
 static uint8_t ble_notify_buf[4 + SD_BLE_SIZE];
 
-static void write_to_gatt(struct bt_conn *conn)
+static void write_to_gatt_inner(struct bt_conn *conn)
 {
     int err;
+    int64_t enomem_deadline = 0;  /* H3: 0 = not currently in an -ENOMEM stall */
     if (sync_speed_mode != SYNC_SPEED_MODE_BLE) {
         sync_speed_reset(SYNC_SPEED_MODE_BLE);
     }
@@ -581,6 +587,19 @@ static void write_to_gatt(struct bt_conn *conn)
                         remaining_length = 0;
                         return;
                     }
+                    /* H3: bound the busy-spin. FB_STORAGE is only beaten after
+                     * write_to_gatt returns, so an unbounded -ENOMEM spin would
+                     * starve the heartbeat into a supervisor SD_STALL reboot
+                     * (120 s). Abort the drain well below that threshold. */
+                    if (enomem_deadline == 0) {
+                        enomem_deadline = k_uptime_get() + WRITE_GATT_ENOMEM_DEADLINE_MS;
+                    } else if (k_uptime_get() > enomem_deadline) {
+                        LOG_ERR("BLE notify -ENOMEM persisted > %d ms, aborting drain",
+                                WRITE_GATT_ENOMEM_DEADLINE_MS);
+                        transfer_end_status = STORAGE_NOT_READY;
+                        remaining_length = 0;
+                        return;
+                    }
                     k_yield();
                     continue;
                 }
@@ -596,14 +615,38 @@ static void write_to_gatt(struct bt_conn *conn)
                 sync_speed_add_bytes(chunk);
                 current_read_offset += chunk;
                 remaining_length -= chunk;
+                enomem_deadline = 0;  /* H3: progress made; reset the stall deadline */
             }
         }
+}
+
+/* H2: take a ref for the whole (multi-second) drain. storage_write passes
+ * current_connection without one; a peer disconnect unrefs+NULLs it under
+ * write_to_gatt_inner's loop, which would otherwise notify a recycled conn.
+ * This wrapper keeps a single ref/unref pair around every inner exit path. */
+static void write_to_gatt(struct bt_conn *conn)
+{
+    if (conn == NULL) {
+        remaining_length = 0;
+        return;
+    }
+    conn = bt_conn_ref(conn);
+    write_to_gatt_inner(conn);
+    bt_conn_unref(conn);
 }
 
 void storage_stop_transfer()
 {
     remaining_length = 0;
     stop_started = 1;
+    /* H5: also clear the rest of the transfer state. storage_stop_transfer is
+     * now called from _transport_disconnected too, so a mid-drain disconnect
+     * must not leave current_sync_file_index / sync_speed_mode dirty (which
+     * spuriously aborts the next sync). The storage thread tolerates these
+     * being reset here — its post-transfer cleanup re-clears the same fields. */
+    current_sync_file_index = -1;
+    transport_started = 0;
+    sync_speed_mode = SYNC_SPEED_MODE_NONE;
 }
 
 bool storage_transfer_active(void)

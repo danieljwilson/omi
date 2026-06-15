@@ -670,8 +670,10 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
 
     err = bt_conn_get_info(conn, &info);
     if (err) {
+        // H1: the connected callback receives a borrowed conn — the BLE stack
+        // owns the reference until we take our own (bt_conn_ref below). Unref'ing
+        // here drops a ref we never held and underflows the refcount. Just log.
         LOG_ERR("Failed to get connection info (err %d)", err);
-        bt_conn_unref(conn);
         return;
     }
 
@@ -895,13 +897,22 @@ static void _transport_disconnected(struct bt_conn *conn, uint8_t err)
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
     sd_notify_ble_state(false);
     storage_is_on = false;
+    // H5: storage_stop_transfer was only wired to CMD_STOP_SYNC, so a mid-drain
+    // disconnect left the transfer state dirty (spurious abort on the next sync)
+    // and the storage drain loop could keep notifying the conn we unref just
+    // below. Tear the transfer down so the stop_started checks fire immediately.
+    storage_stop_transfer();
 #endif
 
     LOG_INF("Transport disconnected");
 
-    if (current_connection != NULL) {
-        bt_conn_unref(current_connection);
-        current_connection = NULL;
+    // H4: publish the NULL before dropping the ref so concurrent readers
+    // (pusher's current_connection read, storage drain, status notifiers) never
+    // observe a pointer whose refcount we just released. Unref the local copy.
+    struct bt_conn *disconnected = current_connection;
+    current_connection = NULL;
+    if (disconnected != NULL) {
+        bt_conn_unref(disconnected);
     }
     current_mtu = 0;
     charging_status_last_notified = -1;
