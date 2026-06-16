@@ -1550,7 +1550,15 @@ void pusher(void)
             }
 #endif
             if (conn) {
-                if (is_subscribed) {
+                // While a storage drain is in flight, yield the shared BLE TX
+                // pool to it exclusively. Pushing live audio here competes for
+                // the same ACL buffers and can starve audio_tx_sem into Lever 1's
+                // 5 s bt_conn_disconnect teardown, dropping the link mid-drain.
+                // SD capture is unaffected (write_to_storage already ran above);
+                // only the live BLE leg pauses for the (short) drain. The
+                // forensics_beat(FB_PUSHER) above still fires, so no spurious
+                // PUSHER_STALL.
+                if (is_subscribed && !storage_transfer_active()) {
                     push_to_gatt(conn);
                 } else if (!stored) {
                     k_sleep(K_MSEC(10));
