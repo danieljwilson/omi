@@ -90,9 +90,33 @@ jobs:
           grep -q '^CONFIG_IPC_RADIO_BT_HCI_IPC=y' "$CFG" || { echo "netcore lost IPC_RADIO_BT_HCI_IPC"; exit 1; }
           echo "netcore config OK"
 
+      - name: Stage DFU package (sibling file keeps it a usable zip)
+        working-directory: ncs
+        run: |
+          # The DFU package is itself a zip, and GitHub wraps every artifact in
+          # another zip. When the inner content is a single zip, macOS Archive
+          # Utility recursively auto-extracts it on download, leaving a loose
+          # dfu_application/ folder instead of the dfu_application.zip that nRF
+          # Connect Device Manager expects. Shipping a sibling file next to the
+          # zip stops that recursion, so the download yields dfu_application.zip.
+          mkdir -p dfu_out
+          cp build/dfu_application.zip dfu_out/
+          printf '%s\n' \
+            'OMI firmware (offline-recording).' \
+            '' \
+            'Flash dfu_application.zip via nRF Connect Device Manager (OTA, both' \
+            'cores: app + netcore). Morning only; then time-sync + a short test' \
+            'recording + a drain.' \
+            '' \
+            'This README sits next to the zip so macOS Archive Utility does not' \
+            'recursively auto-extract dfu_application.zip into a loose folder.' \
+            'Use dfu_application.zip as-is.' \
+            > dfu_out/README-FLASH.txt
+          echo "--- staged artifact contents ---"; ls -l dfu_out
+
       - name: Upload DFU package
         uses: actions/upload-artifact@v7
         with:
           name: omi-firmware-offline-recording
-          path: ncs/build/dfu_application.zip
+          path: ncs/dfu_out/
           if-no-files-found: error
