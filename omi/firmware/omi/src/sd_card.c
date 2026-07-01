@@ -2320,6 +2320,24 @@ int get_audio_file_list_with_sizes(char filenames[][MAX_FILENAME_LEN], uint32_t 
             filenames[i][MAX_FILENAME_LEN - 1] = '\0';
             if (sizes) {
                 sizes[i] = cached_file_sizes[i];
+                /* The cache reflects only bytes flushed to LittleFS; the
+                 * active file's newest tail is still in write_batch_buffer
+                 * (cached_file_sizes advances only in flush_batch_buffer()).
+                 * The old sizes path went through the worker and so ran after
+                 * the connect-queued REQ_FLUSH_FILE; this fast path does not,
+                 * so a bare cache read can UNDER-report the current file's
+                 * size (Codex P1). Add the unflushed tail so the served size
+                 * is never short of what the phone can eventually read — no
+                 * flush and no worker round trip, so the anti-starvation
+                 * fast path is preserved. Read write_batch_offset AFTER the
+                 * cache size so a flush landing mid-loop skews at most one
+                 * batch toward OVER-report, which is benign: setup_file_transfer
+                 * caps the read by this size and the read-path lazy-flush-on-EOF
+                 * + the phone's saved-offset resume heal a short/over read. */
+                if (current_filename[0] != '\0' &&
+                    strcmp(cached_file_names[i], current_filename) == 0) {
+                    sizes[i] += (uint32_t) write_batch_offset;
+                }
             }
         }
         __asm__ volatile("" ::: "memory"); /* copy completes before the re-check */
