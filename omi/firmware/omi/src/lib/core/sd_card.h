@@ -11,6 +11,12 @@
 #define MAX_FILENAME_LEN 64
 #define MAX_AUDIO_FILES 100
 #define FILE_ROTATION_INTERVAL_MS (30 * 60 * 1000) // 30 minutes in milliseconds
+// Force rotation once a single file reaches this size, independent of the 30-min
+// time cap, so a boot-continuation can't oversize a file past what BLE can
+// transfer / Supabase will accept. 45 MB: under the recordings bucket's 50 MB
+// per-file cap (with headroom for the <=1-batch overshoot), and well above a
+// normal ~5-7 MB / 30-min Opus file, so it only trips on genuine oversizing.
+#define MAX_FILE_SIZE_BYTES (45u * 1024u * 1024u)
 
 /* Request types for the SD worker */
 typedef enum {
