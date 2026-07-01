@@ -257,7 +257,13 @@ static uint32_t deferred_timesync_utc_time = 0;
 static uint32_t cached_stats_file_count = 0;
 static uint64_t cached_stats_total_size = 0;
 static int64_t cached_stats_valid_until_ms = 0;
-static bool file_cache_valid = false;
+/* volatile: read cross-thread by get_audio_file_list[_with_sizes]'s lock-free
+ * cache fast path (BLE/caller context) while the SD worker thread mutates the
+ * cache. refresh_file_cache() clears this for the whole rebuild and the fast
+ * path re-checks it after copying (with a compiler barrier), so a concurrent
+ * rebuild makes the reader fall back to the worker path, never return a torn
+ * list. Safe on this single-core MCU; see get_audio_file_list(). */
+static volatile bool file_cache_valid = false;
 static int cached_file_list_count = 0;
 static uint32_t cached_total_file_count = 0;
 static uint64_t cached_total_file_size = 0;
@@ -1068,6 +1074,12 @@ static int refresh_file_cache(void)
     int list_count = 0;
     uint32_t total_count = 0;
     uint64_t total_size = 0;
+
+    /* Mark the cache invalid for the whole rebuild so the lock-free fast path in
+     * get_audio_file_list[_with_sizes]() falls back to the worker path while the
+     * arrays below are being memset + repopulated (instead of copying a torn
+     * list). Re-validated at the end. */
+    file_cache_valid = false;
 
     memset(cached_file_names, 0, sizeof(cached_file_names));
     memset(cached_file_sizes, 0, sizeof(cached_file_sizes));
@@ -2214,17 +2226,31 @@ int get_audio_file_list(char filenames[][MAX_FILENAME_LEN], int max_files, int *
         return -ECANCELED;
     }
 
-    /* Fast path: during boot the worker is blocked in lfs_fs_gc(),
-     * so it cannot service the priority queue.  Return the file list
-     * that was cached during print_audio_files_at_boot() instead. */
-    if (!atomic_get(&sd_boot_ready) && file_cache_valid) {
+    /* Fast path: serve the maintained file-list cache directly, WITHOUT a round
+     * trip through the single SD worker thread. Under SD-primary recording the
+     * worker can be blocked for a long time in a write or lfs_fs_gc(), which
+     * used to time LIST out at 5 s (recording-vs-LIST contention; see
+     * docs/issues/2026-06-30-device-sync-list-starved-by-sd-worker-contention.md).
+     * The cache is mutated only by the worker; refresh_file_cache() clears
+     * file_cache_valid for the duration of a rebuild, and we re-check it after
+     * copying (with a compiler barrier so the copy is not reordered past the
+     * re-check) — a concurrent rebuild makes us fall through to the worker path
+     * instead of returning a torn list. A rebuild does slow LFS I/O and cannot
+     * start-and-complete within this short copy, so the post-copy re-check is
+     * sufficient on this single-core MCU. (Was boot-only:
+     * `!atomic_get(&sd_boot_ready) && file_cache_valid`.) */
+    if (file_cache_valid) {
         int n = cached_file_list_count < max_files ? cached_file_list_count : max_files;
         for (int i = 0; i < n; i++) {
             strncpy(filenames[i], cached_file_names[i], MAX_FILENAME_LEN - 1);
             filenames[i][MAX_FILENAME_LEN - 1] = '\0';
         }
-        *count = n;
-        return 0;
+        __asm__ volatile("" ::: "memory"); /* copy completes before the re-check */
+        if (file_cache_valid) {
+            *count = n;
+            return 0;
+        }
+        /* a rebuild started mid-copy — fall through to the worker path */
     }
 
     static struct file_list_resp resp;
@@ -2280,20 +2306,46 @@ int get_audio_file_list_with_sizes(char filenames[][MAX_FILENAME_LEN], uint32_t 
         return -ECANCELED;
     }
 
-    /* Fast path: during boot the worker is blocked in lfs_fs_gc(),
-     * so it cannot service the priority queue.  Return the file list
-     * that was cached during print_audio_files_at_boot() instead. */
-    if (!atomic_get(&sd_boot_ready) && file_cache_valid) {
+    /* Fast path: serve the maintained file-list cache (with sizes) directly,
+     * WITHOUT a round trip through the single SD worker thread — the same
+     * recording-vs-LIST contention fix as get_audio_file_list(); see its comment
+     * for the concurrency reasoning (refresh_file_cache() invalidates for the
+     * rebuild; copy then re-check file_cache_valid with a compiler barrier and
+     * fall through to the worker path on a concurrent rebuild). This is the
+     * variant the phone's storage sync uses (it needs sizes). (Was boot-only.) */
+    if (file_cache_valid) {
         int n = cached_file_list_count < max_files ? cached_file_list_count : max_files;
         for (int i = 0; i < n; i++) {
             strncpy(filenames[i], cached_file_names[i], MAX_FILENAME_LEN - 1);
             filenames[i][MAX_FILENAME_LEN - 1] = '\0';
             if (sizes) {
                 sizes[i] = cached_file_sizes[i];
+                /* The cache reflects only bytes flushed to LittleFS; the
+                 * active file's newest tail is still in write_batch_buffer
+                 * (cached_file_sizes advances only in flush_batch_buffer()).
+                 * The old sizes path went through the worker and so ran after
+                 * the connect-queued REQ_FLUSH_FILE; this fast path does not,
+                 * so a bare cache read can UNDER-report the current file's
+                 * size (Codex P1). Add the unflushed tail so the served size
+                 * is never short of what the phone can eventually read — no
+                 * flush and no worker round trip, so the anti-starvation
+                 * fast path is preserved. Read write_batch_offset AFTER the
+                 * cache size so a flush landing mid-loop skews at most one
+                 * batch toward OVER-report, which is benign: setup_file_transfer
+                 * caps the read by this size and the read-path lazy-flush-on-EOF
+                 * + the phone's saved-offset resume heal a short/over read. */
+                if (current_filename[0] != '\0' &&
+                    strcmp(cached_file_names[i], current_filename) == 0) {
+                    sizes[i] += (uint32_t) write_batch_offset;
+                }
             }
         }
-        *count = n;
-        return 0;
+        __asm__ volatile("" ::: "memory"); /* copy completes before the re-check */
+        if (file_cache_valid) {
+            *count = n;
+            return 0;
+        }
+        /* a rebuild started mid-copy — fall through to the worker path */
     }
 
     static struct file_list_resp resp;
