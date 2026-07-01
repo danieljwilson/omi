@@ -866,6 +866,19 @@ static int try_continue_latest_file(void)
     }
 
     current_file_size = (uint32_t) lfs_file_size(&lfs_fs, &lfs_fil_data);
+
+    /* Fix 5: if the latest file is already at/over the byte cap, don't append —
+     * it would not time-rotate for another 30 min and could exceed the Supabase
+     * 50 MB / BLE-transferable ceiling. Close it and decline so the caller starts
+     * a fresh file (mirrors the open-failed decline above). */
+    if (current_file_size >= MAX_FILE_SIZE_BYTES) {
+        LOG_INF("[SD_BOOT] Latest file %s is %u bytes (>= cap), starting fresh",
+                current_filename, current_file_size);
+        lfs_file_close(&lfs_fs, &lfs_fil_data);
+        current_filename[0] = '\0';
+        return -1;
+    }
+
     bytes_since_sync = 0;
     write_batch_offset = 0;
     write_batch_counter = 0;
@@ -998,6 +1011,8 @@ static bool should_rotate_file(void)
 {
     if (current_file_created_uptime_ms == 0)
         return false;
+    if (current_file_size >= MAX_FILE_SIZE_BYTES)
+        return true; // byte-size cap: don't grow a file past what BLE/Storage can take
     return (k_uptime_get() - current_file_created_uptime_ms) >= FILE_ROTATION_INTERVAL_MS;
 }
 
