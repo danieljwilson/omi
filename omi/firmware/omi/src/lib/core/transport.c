@@ -1717,6 +1717,42 @@ int transport_start()
     memset(storage_temp_data, 0, OPUS_PADDED_LENGTH * 4);
     bt_gatt_service_register(&storage_service);
 #endif
+
+#ifdef CONFIG_OMI_ENABLE_BATTERY
+    // Seed the standard Battery Service with a REAL level BEFORE advertising, so
+    // a phone that connects immediately reads the true value instead of Zephyr's
+    // compile-time default of 100% -- which otherwise jumps to the real level a
+    // few seconds later once the periodic battery_work first runs (the "fake
+    // 100%" flash users see on a fresh connect). broadcast_battery_level only
+    // sets BAS while CONNECTED, so nothing else populates it before the first
+    // post-connect tick. The very first ADC read is intentionally discarded
+    // (-EAGAIN) to let the voltage divider settle, so take up to a couple of
+    // reads until one is valid; if none lands, skip the seed and let the
+    // existing battery_work set it as before (no worse than today).
+    {
+        uint16_t seed_millivolt = 0;
+        int seed_rc = -EAGAIN;
+        for (int i = 0; i < 3 && seed_rc == -EAGAIN; i++) {
+            seed_rc = battery_get_millivolt(&seed_millivolt);
+        }
+        uint8_t seed_percentage = 0;
+        if (seed_rc == 0 &&
+            battery_get_percentage(&seed_percentage, seed_millivolt) == 0) {
+            int seed_err = bt_bas_set_battery_level(seed_percentage);
+            if (seed_err) {
+                LOG_ERR("BAS pre-advertising seed failed (err %d)", seed_err);
+            } else {
+                battery_percentage = seed_percentage;  // keep the global in sync
+                LOG_INF("Seeded BAS with real level %d%% before advertising",
+                        seed_percentage);
+            }
+        } else {
+            LOG_WRN("Could not seed BAS pre-advertising (rc %d); battery_work "
+                    "will set it on the first tick", seed_rc);
+        }
+    }
+#endif
+
     advertising_intended = true;  // Lever 4A: we intend to advertise from here on
     err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
     if (err) {
