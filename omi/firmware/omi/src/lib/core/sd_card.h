@@ -31,6 +31,7 @@ typedef enum {
     REQ_FLUSH_FILE,
     REQ_TIME_SYNCED,
     REQ_UNMOUNT,
+    REQ_CLOSE_FILE,  // close the current file so the next write starts a new one
 } sd_req_type_t;
 
 /* Read request response object */
@@ -197,6 +198,19 @@ int get_offset(char *filename, uint32_t *offset);
  * @return 0 if successful, negative errno code if error
  */
 int create_new_audio_file(void);
+
+/**
+ * @brief Close the current audio file (deferred create).
+ *
+ * Flushes + closes the current file and clears current_filename WITHOUT opening
+ * a new one; the next write lazy-creates a fresh file (with that write's
+ * timestamp). Used on double-tap STOP so each recording session becomes its own
+ * file/timestamp instead of appending the next session onto the current file.
+ * Fire-and-forget, queued on the NORMAL request queue so it is ordered AFTER the
+ * stopping session's already-queued writes (no truncation of the last audio).
+ * @return 0 if the request was queued, negative errno code if not
+ */
+int close_current_audio_file(void);
 
 /**
  * @brief Notify that BLE connection state has changed

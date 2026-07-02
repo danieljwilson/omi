@@ -1624,6 +1624,29 @@ void sd_worker_thread(void)
             break;
         }
 
+        /* ---- Close current file on STOP (defer new-file create to next write) ---- */
+        case REQ_CLOSE_FILE: {
+            /* Mirror the close-prefix create_audio_file_with_timestamp already
+             * runs on the 30-min rotation (flush batched audio + close
+             * lfs_fil_data + clear current_filename) but WITHOUT creating a new
+             * file. The next write's lazy-create opens a fresh file named from
+             * that write's timestamp -- so a double-tap STOP/START yields one
+             * file per session instead of appending the next session onto this
+             * one. Deferring the create to the write avoids an empty file and
+             * the same-second filename collision an eager create would cause. */
+            if (!current_file_deleted && current_filename[0] != '\0') {
+                flush_batch_buffer();
+                lfs_file_close(&lfs_fs, &lfs_fil_data);
+                LOG_INF("[SD_WORK] Closed %s on STOP; next write opens a fresh file", current_filename);
+                current_filename[0] = '\0';
+            }
+            if (req.u.create_file.resp) {
+                req.u.create_file.resp->res = 0;
+                k_sem_give(&req.u.create_file.resp->sem);
+            }
+            break;
+        }
+
         /* ---- Unmount SD/LFS (must run on worker thread) ---- */
         case REQ_UNMOUNT: {
             /* Shutdown path: stop accepting new writes and drain queued writes
@@ -2147,6 +2170,23 @@ int create_new_audio_file(void)
 
     if (ble_connected)
         ble_connect_time_ms = k_uptime_get();
+    return 0;
+}
+
+int close_current_audio_file(void)
+{
+    /* Fire-and-forget on the NORMAL queue (NOT the priority queue): the close
+     * must be ordered AFTER the stopping session's already-queued writes, or the
+     * last audio batch could be truncated. STOP is user-initiated and rare, so a
+     * short enqueue timeout is fine and the caller (button / BLE handler) is not
+     * blocked on I/O. The next write lazy-creates a fresh file. */
+    sd_req_t req = {0};
+    req.type = REQ_CLOSE_FILE;
+    int ret = k_msgq_put(&sd_msgq, &req, K_MSEC(2000));
+    if (ret) {
+        LOG_ERR("Failed to queue close_current_audio_file: %d", ret);
+        return -1;
+    }
     return 0;
 }
 

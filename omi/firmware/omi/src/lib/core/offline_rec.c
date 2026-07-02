@@ -186,6 +186,14 @@ void offline_rec_set_enabled(bool enabled)
     rec_enabled = enabled;
     persist_rec_enabled();
     LOG_INF("Offline recording %s", enabled ? "STARTED" : "STOPPED");
+    if (!enabled) {
+        // Close the current file so the NEXT start begins a new file with its
+        // own timestamp -- one file per recording session, instead of appending
+        // every stop/start within a power cycle into one file with one
+        // started_at (the attribution defect). Fire-and-forget + normal queue,
+        // so it runs after this session's queued writes.
+        close_current_audio_file();
+    }
     transport_notify_offline_status();
 }
 
