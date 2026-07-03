@@ -225,6 +225,21 @@ void check_button_level(struct k_work *work_item)
         }
         /* Keep the last stable level: a read error is not a release. */
         pressed_now = last_stable_pressed;
+        /* But never let a SYNTHESIZED held level accumulate press duration:
+         * if the streak began while the button was physically down, the
+         * user's release is invisible, and 75 held ticks (3 s) would reach
+         * LONG_PRESS and power the device off — 7 s BEFORE the streak limit
+         * above could request the attributed reboot, and from a state the
+         * pre-pairent.10 parsing (error == released) could never power off
+         * from. Advancing the press start alongside current_time freezes
+         * the measured duration for the streak's length: a real long press
+         * still lands once reads recover (the required hold merely
+         * stretches by the outage), taps are unaffected (no level
+         * transitions can happen while the level is synthetic), and a
+         * sustained fault is the streak-limit reboot's job alone. */
+        if (btn_is_pressed) {
+            btn_press_start_time++;
+        }
     } else {
         gpio_err_streak = 0;
         pressed_now = (pin_raw == 1);

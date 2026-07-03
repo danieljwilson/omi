@@ -83,8 +83,11 @@ enum forensics_cause {
                              * even after a bt_disable/bt_enable cycle */
     FCAUSE_PRODUCT_DEAD = 11, /* dog-starve backstop latched: a prior attributed
                              * sys_reboot did not take AND button FSM + BLE
-                             * connectability are both gone (write-ahead; the
-                             * actual reset arrives as DOG0 once feeds stop) */
+                             * connectability are both gone. The reset itself
+                             * arrives as DOG0 once feeds stop; forensics_boot
+                             * derives this cause from the surviving
+                             * FHEALTH_PRODUCT_DEAD noinit bit (ni.cause still
+                             * holds the sys_reboot attempt that failed) */
 };
 
 /* Consume the previous life's noinit state and re-arm for this life.
@@ -99,13 +102,28 @@ void forensics_bt_ready(void);
 
 /* Pause the HCI probe (and the PROBE_STUCK supervisor check) around a
  * deliberate bt_disable/bt_enable cycle, so the probe never races a closed
- * HCI transport. Resume with forensics_bt_ready() once the host is back. */
+ * HCI transport. Resume with forensics_bt_ready() once the host is back.
+ *
+ * The suspend flag only gates FUTURE probe iterations: a probe already
+ * inside (or committed to) bt_hci_cmd_send_sync keeps running. Callers about
+ * to bt_disable() must therefore ALSO wait for forensics_probe_in_flight()
+ * to go false — the probe's worst case is the host's 10 s HCI command
+ * timeout, so ~11 s of polling proves it parked. (transport_off gets the
+ * same guarantee implicitly from is_off + turnoff_all's sleeps.) */
 void forensics_bt_suspend(void);
+
+/* True while the probe thread is inside (or committed to) its synchronous
+ * HCI command. Valid quiesce signal only AFTER forensics_bt_suspend():
+ * suspend-then-observe-false means the probe cannot send again until
+ * forensics_bt_ready(). Any context (atomic read). */
+bool forensics_probe_in_flight(void);
 
 void forensics_beat(enum forensics_slot slot);
 
-/* OR a FHEALTH_* bit into the current life's health flags (noinit-backed,
- * surfaced live in the status payload appendix byte [14]). Any context. */
+/* OR a FHEALTH_* bit into the current life's health flags, surfaced live in
+ * the status payload appendix byte [14]. Race-free from any context: the OR
+ * lands in an atomic word; the supervisor tick / fatal handler / fill_status
+ * mirror it into noinit so it still survives an attributed reset. */
 void forensics_health_flag(uint8_t mask);
 
 /* Ask the ISR-context supervisor to perform an attributed reboot on its next

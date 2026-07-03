@@ -1271,10 +1271,20 @@ static int ensure_local_ble_identity(void)
 // workqueue, which is precisely the failure domain (wedged syswq) we are
 // auditing around, and not the supervisor k_timer, because bt_* APIs must
 // never be called from ISR context. The probe is bt_le_adv_start itself:
-//   -EALREADY  -> advertising is genuinely live (healthy, the common case)
+//   -EALREADY  -> the HOST believes advertising is live (the common case)
 //   0          -> it was silently DEAD and this call just healed it
 //   other      -> counted; repeated hard failures escalate to one
 //                 bt_disable/bt_enable cycle, then an attributed reboot.
+// -EALREADY is a WEAK verdict: it comes from the host's own BT_ADV_ENABLED
+// flag without touching the controller, so a netcore that silently dropped
+// the advertiser while the host flag stayed set reads healthy here forever
+// — and conn_audit_failing could then never latch, disarming the
+// product-dead backstop for exactly this class. The weak probe therefore
+// covers host-visible death (missed .recycled, failed re-arm, auto-stop);
+// for host/controller divergence, every STRONG_PROBE_STREAK consecutive
+// -EALREADY audits while disconnected we round-trip real HCI with a
+// deliberate adv stop/start pair, which re-syncs both sides at the cost of
+// a few ms of advertising gap once an hour.
 // GHOST-CONN: the single conn slot (CONFIG_BT_MAX_CONN=1) can also be
 // wedged by a connection object the host no longer considers connected
 // while is_connected stayed true (a lost .disconnected). If GATT provably
@@ -1291,6 +1301,13 @@ static int ensure_local_ble_identity(void)
 #define CONN_AUDIT_INITIAL_DELAY K_SECONDS(60)
 #define CONN_AUDIT_FAIL_LIMIT 3
 #define GATT_GHOST_STALE_MS (10u * 60u * 1000u)
+/* Strong-probe cadence: 120 consecutive -EALREADY audits at 30 s = ~1 h of
+ * "host says advertising" while nothing connected. A phone in range
+ * normally reconnects within seconds, so an hour disconnected means either
+ * the phone is genuinely away (stop/start pair is harmless) or the
+ * controller lost the advertiser while the host flag lies (the pair heals
+ * it). */
+#define CONN_AUDIT_STRONG_PROBE_STREAK 120
 
 /* 2048 rather than the 512-1024 a bare audit loop would need: the
  * escalation path runs bt_disable()/bt_enable() on THIS stack, and the
@@ -1302,6 +1319,7 @@ static void conn_audit_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(conn_audit_work, conn_audit_handler);
 
 static uint8_t adv_fail_streak;
+static uint16_t adv_ealready_streak;
 static bool adv_bt_cycle_used;
 /* Read by the forensics supervisor (product-dead gate) from ISR context. */
 static atomic_t conn_audit_failing;
@@ -1334,8 +1352,30 @@ static void conn_audit_escalate(void)
     LOG_ERR("Conn audit: advertising unrecoverable, cycling BT host once");
 
     /* Park the HCI probe first: probing a closed transport mid-cycle is the
-     * one way this recovery could itself fault the system. */
+     * one way this recovery could itself fault the system. The suspend flag
+     * only gates FUTURE probe iterations — a probe already inside its sync
+     * HCI send (or preempted between its gate check and the send) keeps
+     * running, and bt_disable concurrent with an in-flight sync HCI command
+     * violates the API contract. That in-flight window is widest exactly
+     * when this path runs: a degraded netcore stretches the command toward
+     * the host's 10 s HCI timeout. So after suspending, poll the probe's
+     * in-flight handshake until it is provably parked (transport_off gets
+     * the same guarantee from is_off + turnoff_all's sleeps; this path had
+     * no equivalent barrier). Worst case ~10 s, after which either the
+     * probe returned or the "Controller unresponsive" assert has already
+     * rebooted us with the correct FCAUSE_FATAL_PROBE_INFLIGHT attribution.
+     * If we somehow outlive that with the probe still in flight, skip the
+     * cycle — bt_disable would only corrupt that post-mortem — and hand
+     * the verdict to the supervisor instead. */
     forensics_bt_suspend();
+    for (int waited_ms = 0; forensics_probe_in_flight(); waited_ms += 100) {
+        if (waited_ms >= 11000) {
+            LOG_ERR("Conn audit: HCI probe stuck in flight; skipping BT cycle");
+            forensics_request_reboot(FCAUSE_ADV_DEAD);
+            return;
+        }
+        k_sleep(K_MSEC(100));
+    }
     int err = bt_disable();
     if (err == 0) {
         err = bt_enable(NULL);
@@ -1402,18 +1442,40 @@ static void conn_audit_handler(struct k_work *work)
 
     if (slot_occupied || !advertising_intended) {
         adv_fail_streak = 0;
+        adv_ealready_streak = 0;
         atomic_clear(&conn_audit_failing);
     } else {
         int err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
         if (err == -EALREADY) {
-            /* Healthy: the advertiser is genuinely live. */
+            /* The HOST says the advertiser is live. Trust it for the common
+             * case, but it is only host bookkeeping (see module comment):
+             * after a long unbroken streak of these while nothing connects,
+             * spend one real HCI round-trip re-arming the advertiser so a
+             * silent controller-side drop cannot hide behind the flag
+             * forever. */
             adv_fail_streak = 0;
             atomic_clear(&conn_audit_failing);
+            if (++adv_ealready_streak >= CONN_AUDIT_STRONG_PROBE_STREAK) {
+                adv_ealready_streak = 0;
+                (void) bt_le_adv_stop();
+                err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
+                if (err == 0) {
+                    LOG_INF("Conn audit: strong probe re-armed advertising");
+                } else if (current_connection == NULL) {
+                    /* Now provably broken where the weak probe read healthy;
+                     * count it so the normal escalation ladder takes over. */
+                    adv_fail_streak++;
+                    LOG_ERR("Conn audit: strong probe restart failed (err %d, streak %u)",
+                            err,
+                            adv_fail_streak);
+                }
+            }
         } else if (err == 0) {
             /* It was silently dead and this probe just revived it — the
              * exact outage class Lever 4A could not see. Count it (noinit +
              * status payload heal nibble) so Sentry sees the near-miss. */
             adv_fail_streak = 0;
+            adv_ealready_streak = 0;
             atomic_clear(&conn_audit_failing);
             forensics_adv_healed();
             LOG_WRN("Conn audit: advertising was silently dead; re-armed");
@@ -1421,8 +1483,10 @@ static void conn_audit_handler(struct k_work *work)
             /* Raced an incoming connection: the connectable-adv slot was
              * consumed between our checks. That is health, not failure. */
             adv_fail_streak = 0;
+            adv_ealready_streak = 0;
         } else {
             adv_fail_streak++;
+            adv_ealready_streak = 0;
             LOG_ERR("Conn audit: bt_le_adv_start failed (err %d, streak %u)",
                     err,
                     adv_fail_streak);

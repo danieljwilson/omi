@@ -251,11 +251,21 @@ static uint32_t pending_time_synced_utc = 0;
 /* Deferred double-tap-STOP close when the WRITE queue is full (pairent.10).
  * The button/BLE caller never blocks on the SD queue; the worker performs
  * the close (a) once the write queue drains empty — preserving the
- * close-after-this-session's-writes ordering in the normal STOP case — or
- * (b) from the next write's pre-create path if recording restarted before
- * the queue ever emptied (boundary then lands inside the old backlog: an
- * attribution imprecision bounded by the queue depth, never audio loss). */
+ * close-after-this-session's-writes ordering when nothing restarts — or
+ * (b) from the write path once the stopping session's queued backlog has
+ * all been consumed. The backlog is measured at flag-set time: the flag is
+ * only ever set when the queue is FULL of the stopping session's writes,
+ * so closing on the FIRST write processed would split the file BEFORE the
+ * ~100-write backlog — losing the session tail to a new file stamped at
+ * stop time, and leaving that new file open for a quick re-START to append
+ * onto (the v9 attribution defect back again). pending_close_writes_left
+ * snapshots how many old-session writes are still owed to the file; the
+ * write path closes only after they are all in. Non-write messages inside
+ * the snapshot (REQ_SAVE_OFFSET) inflate the count, so the boundary can
+ * land a few writes late — an attribution imprecision bounded by the
+ * queue depth, never audio loss. */
 static atomic_t pending_close_on_stop;
+static atomic_t pending_close_writes_left;
 
 static bool is_mounted = false;
 static bool sd_enabled = false;
@@ -400,19 +410,26 @@ static void process_write_data_req(const sd_req_t *req)
      * batch-accumulation window between flushes. */
     bool spi_woken = false;
 
-    /* Deferred STOP-close re-attempt (pairent.10): a write arriving with the
-     * flag still set means recording restarted before the queue ever drained
-     * empty, so the queue-empty drain in the worker loop never fired. Close
-     * the old file HERE, before this write, so the session boundary exists
-     * at all (the file split is what the STOP promised) and the lazy-create
+    /* Deferred STOP-close (pairent.10): while the flag is set, the first
+     * pending_close_writes_left writes are the stopping session's own queued
+     * backlog — they belong IN the file the STOP promised to close, so count
+     * them down and let them through. Only once the backlog is fully
+     * consumed does a further write prove recording restarted before the
+     * queue ever drained empty (the queue-empty close in the worker loop
+     * never fired); close the old file HERE, before that first new-session
+     * write, so the session boundary exists at all and the lazy-create
      * below opens the new session's file with this write's timestamp. */
-    if (atomic_cas(&pending_close_on_stop, 1, 0) && current_filename[0] != '\0') {
-        sd_set_io_low_power(false);
-        spi_woken = true;
-        flush_batch_buffer();
-        lfs_file_close(&lfs_fs, &lfs_fil_data);
-        LOG_INF("[SD_WORK] Closed %s on deferred STOP (write path)", current_filename);
-        current_filename[0] = '\0';
+    if (atomic_get(&pending_close_on_stop)) {
+        if (atomic_get(&pending_close_writes_left) > 0) {
+            (void) atomic_dec(&pending_close_writes_left);
+        } else if (atomic_cas(&pending_close_on_stop, 1, 0) && current_filename[0] != '\0') {
+            sd_set_io_low_power(false);
+            spi_woken = true;
+            flush_batch_buffer();
+            lfs_file_close(&lfs_fs, &lfs_fil_data);
+            LOG_INF("[SD_WORK] Closed %s on deferred STOP (write path)", current_filename);
+            current_filename[0] = '\0';
+        }
     }
 
     if (current_filename[0] == '\0') {
@@ -1410,10 +1427,13 @@ void sd_worker_thread(void)
          * EMPTY, so every write the stopping session had already queued is
          * in the file before it closes — the same ordering the queued
          * REQ_CLOSE_FILE gives. Checked every loop turn (<= 2 s cadence);
-         * if new-session writes keep the queue busy instead, the write
-         * path's pre-close in process_write_data_req takes over. */
+         * if a restart's new-session writes keep the queue busy instead,
+         * the backlog-counted pre-close in process_write_data_req takes
+         * over. Clear the backlog counter with the flag so a stale count
+         * never leaks into the next deferral. */
         if (atomic_get(&pending_close_on_stop) && k_msgq_num_used_get(&sd_msgq) == 0) {
             atomic_clear(&pending_close_on_stop);
+            atomic_clear(&pending_close_writes_left);
             if (!current_file_deleted && current_filename[0] != '\0') {
                 sd_set_io_low_power(false);
                 flush_batch_buffer();
@@ -2247,12 +2267,20 @@ int close_current_audio_file(void)
      * caller must NEVER block on the SD queue: on a full queue, hand the
      * close to the worker as a sticky flag instead. The worker drains it
      * once the write queue empties (ordering preserved) or, if recording
-     * restarted first, from the next write's pre-create path (see
-     * pending_close_on_stop). */
+     * restarted first, from the write path once the stopping session's
+     * queued backlog has been consumed (see pending_close_on_stop).
+     *
+     * The backlog snapshot MUST be written before the flag: the worker
+     * reads flag-then-counter, so publishing the counter first guarantees
+     * it never consumes the flag against a stale (zero) count and closes
+     * ahead of the old session's queued writes. Writes the worker drains
+     * between the failed put and the snapshot only shrink the count — they
+     * are already in the file, so the close still lands after them. */
     sd_req_t req = {0};
     req.type = REQ_CLOSE_FILE;
     int ret = k_msgq_put(&sd_msgq, &req, K_NO_WAIT);
     if (ret) {
+        atomic_set(&pending_close_writes_left, (atomic_val_t) k_msgq_num_used_get(&sd_msgq));
         atomic_set(&pending_close_on_stop, 1);
         LOG_WRN("close_current_audio_file: queue full (%d), close deferred to worker", ret);
     }
