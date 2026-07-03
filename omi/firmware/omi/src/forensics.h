@@ -127,8 +127,9 @@ bool forensics_product_dead(void);
 void forensics_button_edge(bool pressed);
 void forensics_button_level(bool pressed);
 
-/* Write the FORENSICS_STATUS_APPENDIX_LEN summary bytes of the previous
- * life into out (the v3 payload appendix). */
+/* Write the FORENSICS_STATUS_APPENDIX_LEN appendix bytes into out (the v3
+ * payload appendix): bytes 0..13 summarize the previous life, bytes 14..15
+ * report the CURRENT life's health flags + heal counts (see layout above). */
 void forensics_fill_status(uint8_t *out);
 
 #endif /* _FORENSICS_H_ */
