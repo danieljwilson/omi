@@ -49,7 +49,9 @@
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
 #include "offline_rec.h"
 #endif
+#include "button.h"
 #include "sd_card.h"
+#include "transport.h"
 
 LOG_MODULE_REGISTER(forensics, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -60,7 +62,12 @@ extern void sys_arch_reboot(int type);
 extern bool is_off;
 extern bool is_connected;
 
-#define FORENSICS_MAGIC 0x50524E34u /* "PRN4" */
+/* Bumped PRN4 -> PRN5 in pairent.10: struct forensics_noinit grew (heal
+ * counters, reboot-attempt counter, health flags). The magic must change with
+ * the layout, or the first boot after a DFU would parse the previous life's
+ * OLD-layout bytes as the new layout and report garbage. A mismatch reads as
+ * a cold boot — the correct degradation. */
+#define FORENSICS_MAGIC 0x50524E35u /* "PRN5" */
 
 #define PROBE_INTERVAL_S 15
 /* Probe interval + the host's 10 s HCI command timeout + worst-case 15 s
@@ -82,6 +89,20 @@ extern bool is_connected;
 /* A subsystem this much older than the death uptime is reported stale. */
 #define STALE_BITMAP_MS 60000u
 
+/* Button-FSM supervision ladder (pairent.10). The 2026-07-01 incident proved
+ * the 40 ms check_button_level chain can die while the sysworkq itself stays
+ * alive (both WDT channels fed, FB_SYSWORKQ fresh) — the self-reschedule was
+ * simply lost. That stall is usually recoverable by re-submitting the work,
+ * so the ladder heals first and reboots only when healing demonstrably
+ * failed: stale > 60 s -> ISR-safe re-kick (30 s apart, budget 2 per boot);
+ * still stale > 150 s with the budget spent -> attributed reboot. The budget
+ * is per boot, not per episode: an FSM that keeps dying after two revivals
+ * has an underlying fault a reboot handles better than endless kicking. */
+#define BUTTON_FSM_STALE_MS 60000u
+#define BUTTON_FSM_HEAL_SPACING_MS 30000u
+#define BUTTON_FSM_REBOOT_MS 150000u
+#define BUTTON_FSM_MAX_HEALS 2u
+
 enum probe_state {
     FPROBE_BT_NOT_READY = 0,
     FPROBE_OK = 1,
@@ -100,6 +121,15 @@ struct forensics_noinit {
     uint8_t cause;          /* enum forensics_cause, written before reboot */
     uint8_t flags;          /* bit0 recording, bit1 connected */
     uint8_t fatal_flag;
+    /* pairent.10 (magic bump PRN5). All are this-life state, zeroed by
+     * forensics_boot; kept in noinit so they survive a sys_reboot that
+     * half-fires and are readable in the post-DOG0 breadcrumb. */
+    uint8_t button_heals;    /* supervisor re-kicks of the button FSM */
+    uint8_t adv_heals;       /* audit resurrections of dead advertising */
+    uint8_t reboot_attempts; /* write-ahead count of attributed sys_reboot
+                              * calls; nonzero on a LATER tick means the
+                              * reboot path itself is dead (backstop gate) */
+    uint8_t health_flags;    /* FHEALTH_* bits */
 };
 
 static struct forensics_noinit ni __noinit;
@@ -114,6 +144,18 @@ static uint8_t prev_button;
 static uint32_t prev_fatal_pc;
 
 static atomic_t bt_ready;
+
+/* First-wins reboot cause requested by a context that must not reboot inline
+ * (button FSM on the sysworkq, connectability audit thread). The supervisor
+ * executes it on its next tick, so all attributed reboots leave from one
+ * place with the same write-ahead discipline. */
+static atomic_t reboot_request;
+
+/* Dog-starve backstop latch — read by both WDT feeders (wdog_facade.c). */
+static atomic_t product_dead;
+
+/* Heal-spacing timestamp; plain static (within-life state only). */
+static uint32_t last_button_kick_ms;
 
 K_THREAD_STACK_DEFINE(probe_stack, 2048);
 static struct k_thread probe_thread_data;
@@ -144,6 +186,39 @@ void forensics_bt_ready(void)
     ni.stamps[FB_HCI_PROBE] = k_uptime_get_32();
     ni.probe_state = FPROBE_OK;
     atomic_set(&bt_ready, 1);
+}
+
+void forensics_bt_suspend(void)
+{
+    /* Clearing bt_ready both (a) makes the probe loop skip its HCI no-op
+     * (bt_hci_cmd_send_sync against a closed transport is undefined-ish
+     * territory we must not enter) and (b) disarms the PROBE_STUCK check,
+     * which is gated on bt_ready — so a slow bt_disable/bt_enable cycle
+     * cannot be misattributed as a netcore wedge. */
+    atomic_set(&bt_ready, 0);
+}
+
+void forensics_health_flag(uint8_t mask)
+{
+    ni.health_flags |= mask;
+}
+
+void forensics_request_reboot(uint8_t cause)
+{
+    (void) atomic_cas(&reboot_request, 0, cause);
+}
+
+void forensics_adv_healed(void)
+{
+    if (ni.adv_heals < UINT8_MAX) {
+        ni.adv_heals++;
+    }
+    ni.health_flags |= FHEALTH_ADV_HEALED;
+}
+
+bool forensics_product_dead(void)
+{
+    return atomic_get(&product_dead) != 0;
 }
 
 /* Replaces sdk-nrf's CONFIG_RESET_ON_FATAL_ERROR handler (omi.conf sets it
@@ -179,9 +254,30 @@ static void supervisor_tick(struct k_timer *timer)
 #endif
     ni.flags = (recording ? 0x01 : 0x00) | (is_connected ? 0x02 : 0x00);
 
-    uint8_t cause = FCAUSE_NONE;
+#ifdef CONFIG_OMI_ENABLE_BUTTON
+    /* Button-FSM self-heal rung, run before the cause chain because it is a
+     * side effect (a kick), not a verdict. k_work_reschedule is in the
+     * ISR-safe subset of the k_work API, so calling button_kick() from this
+     * k_timer context is legal. No logging here: this runs in ISR context
+     * and the tick has always been log-free by design — the noinit heal
+     * counter + FHEALTH_BUTTON_HEALED surface the event instead. */
+    uint32_t btn_age = elapsed(now, ni.stamps[FB_BUTTON_FSM]);
+    if (btn_age > BUTTON_FSM_STALE_MS && ni.button_heals < BUTTON_FSM_MAX_HEALS &&
+        elapsed(now, last_button_kick_ms) >= BUTTON_FSM_HEAL_SPACING_MS) {
+        ni.button_heals++;
+        ni.health_flags |= FHEALTH_BUTTON_HEALED;
+        last_button_kick_ms = now;
+        button_kick();
+    }
+#endif
 
-    if (atomic_get(&bt_ready) && elapsed(now, ni.stamps[FB_HCI_PROBE]) > PROBE_STUCK_MS) {
+    /* Deferred requests (GPIO fault, adv-dead escalation) outrank the
+     * heartbeat heuristics: they are direct observations, not inferences. */
+    uint8_t cause = (uint8_t) atomic_get(&reboot_request);
+
+    if (cause != FCAUSE_NONE) {
+        /* fall through to the reboot below */
+    } else if (atomic_get(&bt_ready) && elapsed(now, ni.stamps[FB_HCI_PROBE]) > PROBE_STUCK_MS) {
         cause = FCAUSE_PROBE_STUCK;
     } else if (elapsed(now, ni.stamps[FB_CODEC]) < UPSTREAM_FRESH_MS &&
                /* Signed: the pusher stamp normally leads the codec stamp by
@@ -206,8 +302,48 @@ static void supervisor_tick(struct k_timer *timer)
     }
 #endif
 
+#ifdef CONFIG_OMI_ENABLE_BUTTON
+    /* Reboot rung of the button ladder: only after the heal budget is spent
+     * AND the FSM stayed stale well past the last kick (60 s stale + kicks
+     * at ~60/90 s + 60 s post-heal grace = 150 s). */
+    if (cause == FCAUSE_NONE && btn_age > BUTTON_FSM_REBOOT_MS &&
+        ni.button_heals >= BUTTON_FSM_MAX_HEALS) {
+        cause = FCAUSE_BUTTON_FSM;
+    }
+#endif
+
+#if defined(CONFIG_OMI_PRODUCT_DEAD_BACKSTOP) && defined(CONFIG_OMI_ENABLE_BUTTON)
+    /* Last-resort dog-starve rung: everything below fires only when
+     *   (a) an attributed sys_reboot was ALREADY attempted this boot
+     *       (ni.reboot_attempts is written ahead of every sys_reboot below;
+     *       observing it nonzero on a later tick proves the reboot path
+     *       itself is dead), AND
+     *   (b) the button FSM is stale with its heal budget spent, AND
+     *   (c) the connectability audit is in its failing state
+     * — i.e. the user can neither press a button nor connect a phone and we
+     * demonstrably cannot soft-reset. Breadcrumb goes to noinit FIRST, then
+     * the latch flips and both WDT feeders (wdog_facade.c) stop feeding, so
+     * the SoC hard-resets via DOG0 within CONFIG_OMI_WATCHDOG_TIMEOUT_MS.
+     * The reset arrives with reset code 2 (watchdog) + FHEALTH_PRODUCT_DEAD,
+     * which is the attribution. */
+    if (!atomic_get(&product_dead) && ni.reboot_attempts > 0 &&
+        btn_age > BUTTON_FSM_REBOOT_MS && ni.button_heals >= BUTTON_FSM_MAX_HEALS &&
+        transport_conn_audit_failing()) {
+        ni.health_flags |= FHEALTH_PRODUCT_DEAD;
+        ni.sup_stamp = now;
+        atomic_set(&product_dead, 1);
+    }
+#endif
+
     if (cause != FCAUSE_NONE) {
         ni.cause = cause;
+        /* Write-ahead: if this sys_reboot works, forensics_boot zeroes the
+         * counter next life; if we are still ticking afterwards, the nonzero
+         * counter arms the dog-starve backstop above. Saturate, never wrap:
+         * a wrap back to 0 would silently disarm the backstop. */
+        if (ni.reboot_attempts < UINT8_MAX) {
+            ni.reboot_attempts++;
+        }
         sys_reboot(SYS_REBOOT_COLD);
     }
 }
@@ -226,8 +362,12 @@ static void probe_thread_fn(void *p1, void *p2, void *p3)
 
     for (;;) {
         k_sleep(K_SECONDS(PROBE_INTERVAL_S));
-        if (is_off) {
-            continue; /* transport_off may be running bt_disable */
+        if (is_off || !atomic_get(&bt_ready)) {
+            /* is_off: transport_off may be running bt_disable.
+             * !bt_ready: the connectability audit is mid bt_disable/enable
+             * cycle (forensics_bt_suspend) — probing a closed HCI transport
+             * would fault, and the PROBE_STUCK check is disarmed anyway. */
+            continue;
         }
         /* Write-ahead: if the netcore is unresponsive this call never
          * returns — it asserts at +10 s and the fatal handler reboots.
@@ -353,4 +493,9 @@ void forensics_fill_status(uint8_t *out)
     out[8] = prev_flags;
     out[9] = prev_button;
     put_le32(out + 10, prev_fatal_pc);
+    /* pairent.10 append-only: CURRENT-life health, read live from noinit
+     * (bytes 0..13 above are the previous life; these two are this boot —
+     * the app alarms on them without waiting for a reboot). */
+    out[14] = ni.health_flags;
+    out[15] = (uint8_t) (MIN(ni.button_heals, 15u) | (MIN(ni.adv_heals, 15u) << 4));
 }

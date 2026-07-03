@@ -57,6 +57,7 @@ static bool storage_full_warned = false;
 static bool advertising_intended = false;
 
 extern bool is_connected;
+extern bool is_off;
 extern bool led_app_override;
 extern uint8_t led_app_color;
 #ifdef CONFIG_OMI_ENABLE_BATTERY
@@ -623,6 +624,7 @@ static int notify_charging_status(struct bt_conn *conn, bool force_notify)
 
     charging_status_last_notified = (int8_t) charging_status;
     LOG_INF("Charging status notified: %u", charging_status);
+    transport_mark_gatt_activity();
     return 0;
 }
 
@@ -722,6 +724,9 @@ static void _transport_connected(struct bt_conn *conn, uint8_t err)
 
     is_connected = true;
     atomic_clear(&ble_tx_stalled);  // Lever 1: fresh link, re-enable the BLE leg
+    // Seed the ghost-conn staleness window: a brand-new link must never
+    // inherit a 10-min-old activity stamp from the previous connection.
+    transport_mark_gatt_activity();
 
     if (IS_ENABLED(CONFIG_SHELL_BT_NUS)) {
         shell_bt_nus_enable(conn);
@@ -792,8 +797,9 @@ static ssize_t led_control_write_handler(struct bt_conn *conn,
 
 #ifdef CONFIG_OMI_ENABLE_OFFLINE_STORAGE
 // --- Offline recording control/status characteristic (19B10007) ---
-// Read/notify: status payload v3, 34 bytes = 20-byte v2 prefix + 14-byte
-// wedge-forensics appendix (see offline_rec_get_status / forensics_fill_status).
+// Read/notify: status payload v3, 36 bytes = 20-byte v2 prefix + 16-byte
+// wedge-forensics appendix (see offline_rec_get_status / forensics_fill_status;
+// appendix bytes 14-15 are the pairent.10 current-life health extension).
 // Write: 0x00 = stop recording, 0x01 = start recording, 0x02 = clear markers.
 
 static const struct bt_gatt_attr *offline_ctrl_attr(void)
@@ -833,7 +839,11 @@ void transport_notify_offline_status(void)
         len = OFFLINE_REC_STATUS_V2_LEN;
         status[0] = 2;
     }
-    bt_gatt_notify(conn, attr, status, len);
+    if (bt_gatt_notify(conn, attr, status, len) == 0) {
+        // The 30 s housekeeping status notify doubles as the idle-link
+        // keepalive for the ghost-conn audit window.
+        transport_mark_gatt_activity();
+    }
 }
 
 static ssize_t offline_ctrl_read_handler(struct bt_conn *conn,
@@ -854,6 +864,9 @@ static ssize_t offline_ctrl_write_handler(struct bt_conn *conn,
                                           uint16_t offset,
                                           uint8_t flags)
 {
+    // Inbound control write = the RX side of the link demonstrably works.
+    transport_mark_gatt_activity();
+
     if (len < 1) {
         return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
     }
@@ -1245,6 +1258,185 @@ static int ensure_local_ble_identity(void)
 }
 
 //
+// Connectability audit (pairent.10, Lever 4B)
+//
+// Lever 4A (.recycled re-arm) closed the common "advertising not restarted
+// after disconnect" hole, but its own comment admits nothing notices if the
+// re-arm FAILS — and no path at all notices advertising dying while we sit
+// disconnected (controller state loss, a missed .recycled, a failed re-arm).
+// A device that is not connected and not advertising is product-dead: the
+// phone can never reach it again without a power-cycle.
+//
+// This audit runs every 30 s on its OWN tiny workqueue — NOT the system
+// workqueue, which is precisely the failure domain (wedged syswq) we are
+// auditing around, and not the supervisor k_timer, because bt_* APIs must
+// never be called from ISR context. The probe is bt_le_adv_start itself:
+//   -EALREADY  -> advertising is genuinely live (healthy, the common case)
+//   0          -> it was silently DEAD and this call just healed it
+//   other      -> counted; repeated hard failures escalate to one
+//                 bt_disable/bt_enable cycle, then an attributed reboot.
+// GHOST-CONN: the single conn slot (CONFIG_BT_MAX_CONN=1) can also be
+// wedged by a connection object the host no longer considers connected
+// while is_connected stayed true (a lost .disconnected). If GATT provably
+// moved nothing for 10+ min AND bt_conn_get_info disagrees with
+// is_connected, tear it down with bt_conn_disconnect — never a forced
+// unref (H1/H4: the refcount belongs to the callback lifecycle; a forced
+// release here could underflow when the real callback finally fires). If
+// the teardown cannot free the slot, the adv probe keeps failing and the
+// escalation ladder (bt cycle force-frees every conn) recovers it.
+
+#define CONN_AUDIT_PERIOD K_SECONDS(30)
+/* First run past the supervisor's boot grace so a slow BT bring-up is never
+ * audited; transport_start arms this only after bt_enable succeeded. */
+#define CONN_AUDIT_INITIAL_DELAY K_SECONDS(60)
+#define CONN_AUDIT_FAIL_LIMIT 3
+#define GATT_GHOST_STALE_MS (10u * 60u * 1000u)
+
+/* 2048 rather than the 512-1024 a bare audit loop would need: the
+ * escalation path runs bt_disable()/bt_enable() on THIS stack, and the
+ * fork's precedent for HCI-touching threads (probe_stack) is 2048. A stack
+ * fault inside the recovery path would defeat its purpose. */
+K_THREAD_STACK_DEFINE(conn_audit_stack, 2048);
+static struct k_work_q conn_audit_q;
+static void conn_audit_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(conn_audit_work, conn_audit_handler);
+
+static uint8_t adv_fail_streak;
+static bool adv_bt_cycle_used;
+/* Read by the forensics supervisor (product-dead gate) from ISR context. */
+static atomic_t conn_audit_failing;
+/* uint32 uptime of the last proven GATT data movement. 32-bit atomic so
+ * stamps from BT RX / storage / sysworkq threads never tear (a 64-bit
+ * uptime would). Wrap-safe by unsigned subtraction, like forensics.c. */
+static atomic_t last_gatt_activity;
+
+void transport_mark_gatt_activity(void)
+{
+    atomic_set(&last_gatt_activity, (atomic_val_t) k_uptime_get_32());
+}
+
+bool transport_conn_audit_failing(void)
+{
+    return atomic_get(&conn_audit_failing) != 0;
+}
+
+static void conn_audit_escalate(void)
+{
+    if (adv_bt_cycle_used) {
+        /* The one host cycle is spent and advertising is failing again:
+         * hand the verdict to the supervisor (write-ahead cause + reboot
+         * within one 5 s tick). */
+        forensics_request_reboot(FCAUSE_ADV_DEAD);
+        return;
+    }
+    adv_bt_cycle_used = true;
+    forensics_health_flag(FHEALTH_BT_CYCLED);
+    LOG_ERR("Conn audit: advertising unrecoverable, cycling BT host once");
+
+    /* Park the HCI probe first: probing a closed transport mid-cycle is the
+     * one way this recovery could itself fault the system. */
+    forensics_bt_suspend();
+    int err = bt_disable();
+    if (err == 0) {
+        err = bt_enable(NULL);
+    }
+    if (err == 0) {
+        /* Same identity as boot (reloaded from settings), so the phone's
+         * saved peripheral address stays valid. GATT registrations survive
+         * a host cycle; CCCs re-arm on re-subscribe. */
+        (void) ensure_local_ble_identity();
+        forensics_bt_ready();
+        err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
+        if (err == 0 || err == -EALREADY) {
+            adv_fail_streak = 0;
+            atomic_clear(&conn_audit_failing);
+            LOG_WRN("Conn audit: BT cycle recovered advertising");
+            return;
+        }
+        LOG_ERR("Conn audit: advertising still dead after BT cycle (err %d)", err);
+    } else {
+        /* Host did not come back: bt_ready stays cleared so the parked
+         * probe cannot touch the dead transport while the reboot lands. */
+        LOG_ERR("Conn audit: BT cycle failed (err %d)", err);
+    }
+    forensics_request_reboot(FCAUSE_ADV_DEAD);
+}
+
+static void conn_audit_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (is_off) {
+        return; /* power-off teardown owns BT now; do not re-arm */
+    }
+
+    bool slot_occupied = false;
+
+    struct bt_conn *conn = current_connection;
+    if (conn) {
+        conn = bt_conn_ref(conn); /* same borrow pattern as the pusher (H4) */
+    }
+    if (conn) {
+        struct bt_conn_info info;
+        int ierr = bt_conn_get_info(conn, &info);
+
+        if (ierr == 0 && info.state != BT_CONN_STATE_DISCONNECTED) {
+            /* Host agrees the slot is in use (connected or in flux):
+             * advertising is not expected, nothing to audit. */
+            slot_occupied = true;
+        } else if (is_connected &&
+                   (k_uptime_get_32() - (uint32_t) atomic_get(&last_gatt_activity)) >
+                       GATT_GHOST_STALE_MS) {
+            /* Ghost: we believe we are connected, the host's own conn state
+             * disagrees, and no GATT data moved for 10+ min. Ask for a
+             * normal teardown so the usual .disconnected path (H4/H5
+             * cleanup) runs; on -ENOTCONN the adv ladder below reclaims the
+             * slot instead (see module comment on why never force-unref). */
+            LOG_ERR("Conn audit: ghost connection (host state %d, no GATT activity >10 min); tearing down",
+                    ierr == 0 ? info.state : ierr);
+            forensics_health_flag(FHEALTH_GHOST_CONN);
+            (void) bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        }
+        bt_conn_unref(conn);
+    }
+
+    if (slot_occupied || !advertising_intended) {
+        adv_fail_streak = 0;
+        atomic_clear(&conn_audit_failing);
+    } else {
+        int err = bt_le_adv_start(BT_LE_ADV_CONN, bt_ad, ARRAY_SIZE(bt_ad), bt_sd, ARRAY_SIZE(bt_sd));
+        if (err == -EALREADY) {
+            /* Healthy: the advertiser is genuinely live. */
+            adv_fail_streak = 0;
+            atomic_clear(&conn_audit_failing);
+        } else if (err == 0) {
+            /* It was silently dead and this probe just revived it — the
+             * exact outage class Lever 4A could not see. Count it (noinit +
+             * status payload heal nibble) so Sentry sees the near-miss. */
+            adv_fail_streak = 0;
+            atomic_clear(&conn_audit_failing);
+            forensics_adv_healed();
+            LOG_WRN("Conn audit: advertising was silently dead; re-armed");
+        } else if (current_connection != NULL) {
+            /* Raced an incoming connection: the connectable-adv slot was
+             * consumed between our checks. That is health, not failure. */
+            adv_fail_streak = 0;
+        } else {
+            adv_fail_streak++;
+            LOG_ERR("Conn audit: bt_le_adv_start failed (err %d, streak %u)",
+                    err,
+                    adv_fail_streak);
+            if (adv_fail_streak >= CONN_AUDIT_FAIL_LIMIT) {
+                atomic_set(&conn_audit_failing, 1);
+                conn_audit_escalate();
+            }
+        }
+    }
+
+    k_work_reschedule_for_queue(&conn_audit_q, &conn_audit_work, CONN_AUDIT_PERIOD);
+}
+
+//
 // Ring Buffer
 //
 
@@ -1315,6 +1507,9 @@ static void on_audio_tx_done(struct bt_conn *conn, void *user_data)
     ARG_UNUSED(conn);
     ARG_UNUSED(user_data);
     k_sem_give(&audio_tx_sem);
+    // A TX completion is the strongest liveness proof there is: the
+    // controller confirmed the notification left the radio.
+    transport_mark_gatt_activity();
 }
 
 // Thread
@@ -1573,6 +1768,12 @@ int transport_off()
 {
     advertising_intended = false;  // Lever 4A: prevent .recycled re-arming during teardown
 
+    // Lever 4B: stop the connectability audit. If its handler is mid-run it
+    // exits on the is_off check (turnoff_all sets is_off before calling us);
+    // the residual race — one adv probe between our bt_le_adv_stop and
+    // bt_disable — is harmless because bt_disable tears any advertiser down.
+    k_work_cancel_delayable(&conn_audit_work);
+
     // Stop pusher thread when transport is turned off
     atomic_set(&pusher_stop_flag, 1);
     k_sem_give(&tx_queue_sem);
@@ -1758,8 +1959,24 @@ int transport_start()
     if (err) {
         LOG_ERR("Transport advertising failed to start (err %d), continuing without BLE", err);
         // Non-fatal: continue with pusher and ring buffer so offline recording works
+        // (the connectability audit below will keep retrying and escalate if it
+        // never comes up).
     } else {
         LOG_INF("Advertising successfully started");
+    }
+
+    // Lever 4B: arm the connectability audit on its own workqueue. Started
+    // here (not earlier) so it only ever runs with bt_enable done, and with
+    // an initial delay past the boot-settling window.
+    {
+        static const struct k_work_queue_config audit_q_cfg = {.name = "conn_audit"};
+        k_work_queue_init(&conn_audit_q);
+        k_work_queue_start(&conn_audit_q,
+                           conn_audit_stack,
+                           K_THREAD_STACK_SIZEOF(conn_audit_stack),
+                           K_PRIO_PREEMPT(13),
+                           &audit_q_cfg);
+        k_work_reschedule_for_queue(&conn_audit_q, &conn_audit_work, CONN_AUDIT_INITIAL_DELAY);
     }
 
 #ifdef CONFIG_OMI_ENABLE_BATTERY

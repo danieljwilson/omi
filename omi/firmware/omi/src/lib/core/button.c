@@ -171,6 +171,30 @@ static bool btn_is_pressed;
 
 static u_int8_t btn_last_event = BUTTON_EVENT_NONE;
 
+/* GPIO read-fault tracking (pairent.10): gpio_pin_get_dt returning a
+ * negative errno used to parse as "released" via the ==1 comparison, which
+ * would silently swallow presses (and worse, fake a release mid-long-press)
+ * for as long as the driver misbehaves. Hold the last good level instead,
+ * and treat a sustained error streak as a hardware/driver fault worth an
+ * attributed reboot — requested via the supervisor, never performed here
+ * (this handler runs on the shared sysworkq). */
+#define GPIO_ERR_LOG_INTERVAL 100    /* ~4 s of errors between repeat logs */
+#define GPIO_FAULT_STREAK_LIMIT 250  /* ~10 s at the 40 ms poll cadence */
+static uint32_t gpio_err_streak;
+static bool last_stable_pressed;
+
+void button_kick(void)
+{
+    if (is_off) {
+        return;
+    }
+    /* k_work_reschedule is ISR-safe (the supervisor calls this from a
+     * k_timer). It self-guards against double-submit: if the FSM work is
+     * already pending this only moves the deadline forward, and if the
+     * chain was lost (the wedge being healed) it re-arms it. */
+    k_work_reschedule(&button_work, K_NO_WAIT);
+}
+
 void check_button_level(struct k_work *work_item)
 {
     current_time = current_time + 1;
@@ -181,7 +205,31 @@ void check_button_level(struct k_work *work_item)
      * GPIO interrupt delivery dying. Polling keeps taps and long-press
      * power-off working through that failure class; the ISR is kept only
      * as a forensic edge counter. */
-    bool pressed_now = (gpio_pin_get_dt(&usr_btn) == 1);
+    int pin_raw = gpio_pin_get_dt(&usr_btn);
+    bool pressed_now;
+    if (pin_raw < 0) {
+        gpio_err_streak++;
+        /* First error and every ~100th: enough to see the fault and its
+         * duration in a log capture without flooding at 25 Hz. */
+        if (gpio_err_streak == 1 || (gpio_err_streak % GPIO_ERR_LOG_INTERVAL) == 0) {
+            LOG_ERR("Button GPIO read failed (%d), %u consecutive", pin_raw, gpio_err_streak);
+        }
+        if (gpio_err_streak == GPIO_FAULT_STREAK_LIMIT) {
+            /* Sustained fault: taps and long-press power-off are gone no
+             * matter what we parse. Stamp the noinit health flag, then let
+             * the ISR-timer supervisor do the attributed reboot on its next
+             * tick — it owns the write-ahead reboot discipline and survives
+             * whatever killed the GPIO driver. */
+            forensics_health_flag(FHEALTH_GPIO_FAULT);
+            forensics_request_reboot(FCAUSE_GPIO_FAULT);
+        }
+        /* Keep the last stable level: a read error is not a release. */
+        pressed_now = last_stable_pressed;
+    } else {
+        gpio_err_streak = 0;
+        pressed_now = (pin_raw == 1);
+        last_stable_pressed = pressed_now;
+    }
     forensics_button_level(pressed_now);
     forensics_beat(FB_BUTTON_FSM);
 
