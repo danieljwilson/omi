@@ -111,6 +111,18 @@ config OMI_ENABLE_T5838_AAD
          point the driver resumes PDM and the software VAD takes over.
          Requires THSEL (P1.5) and WAKE (P1.2) to be wired to the T5838."
 
+config PAIRENT_WDT_SELFTEST
+    bool "Watchdog bench self-test (THROWAWAY image — never ship)"
+    default n
+    help
+        "Three-phase DESTRUCTIVE watchdog self-test: 60 s after the first
+         boot it hangs the system workqueue (phase 0), 60 s after the next
+         boot it locks IRQs and spins (phase 1), and from the third boot on
+         it behaves normally (phase 2). Each hang must end in a hardware
+         watchdog reset within OMI_WATCHDOG_TIMEOUT_MS. Bench-proves the WDT
+         stack on real hardware. Only ever enabled on the fw/wdt-selftest
+         branch; never merge or ship an image with this on."
+
 config OMI_WATCHDOG_TIMEOUT_MS
     int "Watchdog timeout (ms)"
     range 5000 300000

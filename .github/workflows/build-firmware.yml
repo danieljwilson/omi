@@ -5,6 +5,9 @@ on:
     branches:
       - offline-recording
       - 'wedge-forensics-*'
+      # THROWAWAY watchdog bench-test branch (never merged): listed here so
+      # pushes build a DFU artifact; this line must never reach the base branch.
+      - 'fw/wdt-selftest'
     paths:
       - 'omi/firmware/**'
       - '.github/workflows/build-firmware.yml'

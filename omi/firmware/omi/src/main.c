@@ -28,6 +28,9 @@
 #include "rtc.h"
 #include "spi_flash.h"
 #include "wdog_facade.h"
+#ifdef CONFIG_PAIRENT_WDT_SELFTEST
+#include "wdt_selftest.h"
+#endif
 #ifdef CONFIG_OMI_ENABLE_T5838_AAD
 #include "aad.h"
 #endif
@@ -260,6 +263,12 @@ int main(void)
     // heartbeat (ISSUES #92)
     forensics_boot(reset_code);
 
+#ifdef CONFIG_PAIRENT_WDT_SELFTEST
+    // THROWAWAY bench image: consume the self-test phase byte and record
+    // which reset code ended the previous phase (fw/wdt-selftest branch)
+    wdt_selftest_boot(reset_code);
+#endif
+
     // Initialize watchdog first to catch any early freezes
     ret = watchdog_init();
     if (ret) {
@@ -427,6 +436,11 @@ int main(void)
 
     // Arm the wedge supervisor + netcore HCI probe (ISSUES #92)
     forensics_start();
+
+#ifdef CONFIG_PAIRENT_WDT_SELFTEST
+    // THROWAWAY bench image: arm the T+60 s deliberate wedge (phase 0/1)
+    wdt_selftest_start();
+#endif
 
     while (1) {
         forensics_beat(FB_MAIN_LOOP);

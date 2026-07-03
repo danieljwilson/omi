@@ -50,6 +50,9 @@
 #include "offline_rec.h"
 #endif
 #include "sd_card.h"
+#ifdef CONFIG_PAIRENT_WDT_SELFTEST
+#include "wdt_selftest.h"
+#endif
 
 LOG_MODULE_REGISTER(forensics, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -229,6 +232,16 @@ static void probe_thread_fn(void *p1, void *p2, void *p3)
         if (is_off) {
             continue; /* transport_off may be running bt_disable */
         }
+#ifdef CONFIG_PAIRENT_WDT_SELFTEST
+        if (wdt_selftest_probe_quiesced()) {
+            /* Bench image, hang imminent: HCI command TX runs on the system
+             * workqueue (Zephyr 3.7), so a probe issued during the phase-0
+             * sysworkq hang would hit the 10 s "Controller unresponsive"
+             * assert and reboot us as SREQ before the watchdog can prove
+             * itself. Stand down for the rest of this life. */
+            continue;
+        }
+#endif
         /* Write-ahead: if the netcore is unresponsive this call never
          * returns — it asserts at +10 s and the fatal handler reboots.
          * IN_FLIGHT at next boot is the attribution. */

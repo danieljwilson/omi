@@ -23,6 +23,11 @@ file(GLOB app_sources
 if(CONFIG_OMI_ENABLE_T5838_AAD)
     list(APPEND app_sources src/aad.c)
 endif()
+
+if(CONFIG_PAIRENT_WDT_SELFTEST)
+    # THROWAWAY watchdog bench self-test (fw/wdt-selftest branch only)
+    list(APPEND app_sources src/wdt_selftest.c)
+endif()
 file(GLOB core_sources
     src/lib/core/config.h
     src/lib/core/codec.c
