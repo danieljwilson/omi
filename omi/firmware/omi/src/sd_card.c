@@ -38,6 +38,18 @@ LOG_MODULE_REGISTER(sd_card, CONFIG_LOG_DEFAULT_LEVEL);
 #define DISK_DRIVE_NAME CONFIG_SDMMC_VOLUME_NAME
 #define SD_REQ_QUEUE_MSGS 100
 #define SD_FSYNC_INTERVAL_MS (60 * 1000)
+/* Fix A (2026-06-21 read-latch handoff): bounded grace given to the worker to
+ * post a pending response when a caller finds its in-flight latch still set.
+ * The timeout paths below deliberately do NOT clear their latches (the worker
+ * still owns the static resp + out_buf; clearing early would let a new
+ * request re-init the sem under a pending give and hand the worker a fresh
+ * buffer while the stale write is outstanding — the §5 buffer-reuse race).
+ * Instead, the NEXT caller waits up to this long for the worker's give; if it
+ * lands the latch is reclaimed race-free (the give it consumes is the proof
+ * the old request fully completed). Only a worker still genuinely stuck
+ * returns -EBUSY, so the latch can no longer stick forever after one slow op
+ * (the 2026-06-21 sync wedge that only a power-cycle cleared). */
+#define SD_LATCH_RECLAIM_GRACE_MS 50
 #define WRITE_BATCH_COUNT 100
 #define WRITE_DRAIN_BURST 16
 #define ERROR_THRESHOLD 5
@@ -236,6 +248,24 @@ static atomic_t sd_boot_ready;
 static atomic_t pending_flush_on_ble_connect;
 static atomic_t pending_time_synced;
 static uint32_t pending_time_synced_utc = 0;
+/* Deferred double-tap-STOP close when the WRITE queue is full (pairent.10).
+ * The button/BLE caller never blocks on the SD queue; the worker performs
+ * the close (a) once the write queue drains empty — preserving the
+ * close-after-this-session's-writes ordering when nothing restarts — or
+ * (b) from the write path once the stopping session's queued backlog has
+ * all been consumed. The backlog is measured at flag-set time: the flag is
+ * only ever set when the queue is FULL of the stopping session's writes,
+ * so closing on the FIRST write processed would split the file BEFORE the
+ * ~100-write backlog — losing the session tail to a new file stamped at
+ * stop time, and leaving that new file open for a quick re-START to append
+ * onto (the v9 attribution defect back again). pending_close_writes_left
+ * snapshots how many old-session writes are still owed to the file; the
+ * write path closes only after they are all in. Non-write messages inside
+ * the snapshot (REQ_SAVE_OFFSET) inflate the count, so the boundary can
+ * land a few writes late — an attribution imprecision bounded by the
+ * queue depth, never audio loss. */
+static atomic_t pending_close_on_stop;
+static atomic_t pending_close_writes_left;
 
 static bool is_mounted = false;
 static bool sd_enabled = false;
@@ -379,6 +409,28 @@ static void process_write_data_req(const sd_req_t *req)
      * only during actual flash operations, not during the long
      * batch-accumulation window between flushes. */
     bool spi_woken = false;
+
+    /* Deferred STOP-close (pairent.10): while the flag is set, the first
+     * pending_close_writes_left writes are the stopping session's own queued
+     * backlog — they belong IN the file the STOP promised to close, so count
+     * them down and let them through. Only once the backlog is fully
+     * consumed does a further write prove recording restarted before the
+     * queue ever drained empty (the queue-empty close in the worker loop
+     * never fired); close the old file HERE, before that first new-session
+     * write, so the session boundary exists at all and the lazy-create
+     * below opens the new session's file with this write's timestamp. */
+    if (atomic_get(&pending_close_on_stop)) {
+        if (atomic_get(&pending_close_writes_left) > 0) {
+            (void) atomic_dec(&pending_close_writes_left);
+        } else if (atomic_cas(&pending_close_on_stop, 1, 0) && current_filename[0] != '\0') {
+            sd_set_io_low_power(false);
+            spi_woken = true;
+            flush_batch_buffer();
+            lfs_file_close(&lfs_fs, &lfs_fil_data);
+            LOG_INF("[SD_WORK] Closed %s on deferred STOP (write path)", current_filename);
+            current_filename[0] = '\0';
+        }
+    }
 
     if (current_filename[0] == '\0') {
         sd_set_io_low_power(false);
@@ -1371,6 +1423,27 @@ void sd_worker_thread(void)
          * LFS/SPI call. */
         forensics_beat(FB_SD_WORKER);
 
+        /* Deferred STOP-close (pairent.10): only once the write queue is
+         * EMPTY, so every write the stopping session had already queued is
+         * in the file before it closes — the same ordering the queued
+         * REQ_CLOSE_FILE gives. Checked every loop turn (<= 2 s cadence);
+         * if a restart's new-session writes keep the queue busy instead,
+         * the backlog-counted pre-close in process_write_data_req takes
+         * over. Clear the backlog counter with the flag so a stale count
+         * never leaks into the next deferral. */
+        if (atomic_get(&pending_close_on_stop) && k_msgq_num_used_get(&sd_msgq) == 0) {
+            atomic_clear(&pending_close_on_stop);
+            atomic_clear(&pending_close_writes_left);
+            if (!current_file_deleted && current_filename[0] != '\0') {
+                sd_set_io_low_power(false);
+                flush_batch_buffer();
+                lfs_file_close(&lfs_fs, &lfs_fil_data);
+                LOG_INF("[SD_WORK] Closed %s on deferred STOP (queue drained)", current_filename);
+                current_filename[0] = '\0';
+                sd_set_io_low_power(true);
+            }
+        }
+
         /* Handle deferred control requests first (when queue was saturated). */
         if (atomic_cas(&pending_flush_on_ble_connect, 1, 0)) {
             req.type = REQ_FLUSH_FILE;
@@ -1949,8 +2022,11 @@ int read_audio_data(const char *filename, uint8_t *buf, int amount, int offset)
     static volatile bool read_in_flight;
 
     if (read_in_flight) {
-        /* Check if late worker response arrived */
-        if (k_sem_take(&resp.sem, K_NO_WAIT) == 0) {
+        /* Fix A: bounded grace-take. Converts "worker finished 1 ms after
+         * the last K_NO_WAIT check" from a sticky -EBUSY (which head-of-line
+         * blocked the whole sync queue until a power-cycle) into a recovered
+         * read. See SD_LATCH_RECLAIM_GRACE_MS for the race reasoning. */
+        if (k_sem_take(&resp.sem, K_MSEC(SD_LATCH_RECLAIM_GRACE_MS)) == 0) {
             read_in_flight = false; /* Worker caught up */
         } else {
             LOG_WRN("read_audio_data: previous request still in-flight");
@@ -1995,7 +2071,8 @@ int sd_flush_current_file(void)
     static volatile bool flush_in_flight;
 
     if (flush_in_flight) {
-        if (k_sem_take(&resp.sem, K_NO_WAIT) == 0) {
+        /* Fix A grace-take — same shape as read_audio_data. */
+        if (k_sem_take(&resp.sem, K_MSEC(SD_LATCH_RECLAIM_GRACE_MS)) == 0) {
             flush_in_flight = false;
         } else {
             LOG_WRN("sd_flush: previous flush still in-flight");
@@ -2033,7 +2110,8 @@ int delete_audio_file(const char *filename)
     static volatile bool delete_in_flight;
 
     if (delete_in_flight) {
-        if (k_sem_take(&resp.sem, K_NO_WAIT) == 0) {
+        /* Fix A grace-take — same shape as read_audio_data. */
+        if (k_sem_take(&resp.sem, K_MSEC(SD_LATCH_RECLAIM_GRACE_MS)) == 0) {
             delete_in_flight = false;
         } else {
             LOG_WRN("delete_audio_file: previous delete still in-flight");
@@ -2073,7 +2151,8 @@ int clear_audio_directory(void)
     static volatile bool clear_in_flight;
 
     if (clear_in_flight) {
-        if (k_sem_take(&resp.sem, K_NO_WAIT) == 0) {
+        /* Fix A grace-take — same shape as read_audio_data. */
+        if (k_sem_take(&resp.sem, K_MSEC(SD_LATCH_RECLAIM_GRACE_MS)) == 0) {
             clear_in_flight = false;
         } else {
             LOG_WRN("clear_audio_directory: previous clear still in-flight");
@@ -2177,15 +2256,33 @@ int close_current_audio_file(void)
 {
     /* Fire-and-forget on the NORMAL queue (NOT the priority queue): the close
      * must be ordered AFTER the stopping session's already-queued writes, or the
-     * last audio batch could be truncated. STOP is user-initiated and rare, so a
-     * short enqueue timeout is fine and the caller (button / BLE handler) is not
-     * blocked on I/O. The next write lazy-creates a fresh file. */
+     * last audio batch could be truncated. The next write lazy-creates a fresh
+     * file.
+     *
+     * K_NO_WAIT (pairent.10): this is called from the button FSM / BLE write
+     * handler — i.e. ON the system workqueue / BT RX thread. The previous
+     * K_MSEC(2000) put could park that shared context for 2 s whenever the
+     * write queue was saturated (exactly when the SD worker is slowest),
+     * freezing every other sysworkq client behind a user's double-tap. The
+     * caller must NEVER block on the SD queue: on a full queue, hand the
+     * close to the worker as a sticky flag instead. The worker drains it
+     * once the write queue empties (ordering preserved) or, if recording
+     * restarted first, from the write path once the stopping session's
+     * queued backlog has been consumed (see pending_close_on_stop).
+     *
+     * The backlog snapshot MUST be written before the flag: the worker
+     * reads flag-then-counter, so publishing the counter first guarantees
+     * it never consumes the flag against a stale (zero) count and closes
+     * ahead of the old session's queued writes. Writes the worker drains
+     * between the failed put and the snapshot only shrink the count — they
+     * are already in the file, so the close still lands after them. */
     sd_req_t req = {0};
     req.type = REQ_CLOSE_FILE;
-    int ret = k_msgq_put(&sd_msgq, &req, K_MSEC(2000));
+    int ret = k_msgq_put(&sd_msgq, &req, K_NO_WAIT);
     if (ret) {
-        LOG_ERR("Failed to queue close_current_audio_file: %d", ret);
-        return -1;
+        atomic_set(&pending_close_writes_left, (atomic_val_t) k_msgq_num_used_get(&sd_msgq));
+        atomic_set(&pending_close_on_stop, 1);
+        LOG_WRN("close_current_audio_file: queue full (%d), close deferred to worker", ret);
     }
     return 0;
 }

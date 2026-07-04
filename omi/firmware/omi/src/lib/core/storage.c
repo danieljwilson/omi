@@ -125,7 +125,13 @@ static int storage_notify(struct bt_conn *conn, const void *data, uint16_t len)
         return -EAGAIN;
     }
 
-    return bt_gatt_notify(conn, &storage_service.attrs[STORAGE_WRITE_NOTIFY_ATTR_IDX], data, len);
+    int err = bt_gatt_notify(conn, &storage_service.attrs[STORAGE_WRITE_NOTIFY_ATTR_IDX], data, len);
+    if (err == 0) {
+        /* Feeds the transport ghost-conn audit: a drain in progress is
+         * constant proof the link moves data. */
+        transport_mark_gatt_activity();
+    }
+    return err;
 }
 
 static void storage_config_changed_handler(const struct bt_gatt_attr *attr, uint16_t value)
@@ -486,6 +492,9 @@ static ssize_t storage_write_handler(struct bt_conn *conn,
                                      uint16_t offset,
                                      uint8_t flags)
 {
+    /* Inbound sync command = the link's RX side works (ghost-conn audit). */
+    transport_mark_gatt_activity();
+
     if (len < 1) {
         uint8_t result_buffer[1] = {INVALID_COMMAND};
         LOG_WRN("storage write with empty payload");

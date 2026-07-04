@@ -120,4 +120,17 @@ config OMI_WATCHDOG_TIMEOUT_MS
          operations can run longer (e.g. SD/LFS pre-warm) to avoid false
          watchdog resets."
 
+config OMI_PRODUCT_DEAD_BACKSTOP
+    bool "Dog-starve backstop when the supervisor's reboot path is dead"
+    default y
+    depends on OMI_ENABLE_BUTTON
+    help
+        "Last-resort liveness rung: if an attributed sys_reboot was already
+         attempted this boot yet the device is still running, with the button
+         FSM stale (heal budget spent) AND the BLE connectability audit
+         failing, latch product_dead and stop feeding BOTH hardware watchdog
+         channels so the SoC hard-resets via DOG0 within the watchdog
+         timeout. Breadcrumbed to noinit before feeds stop. Disable to
+         compile the rung out if the bench test shows false trips."
+
 endmenu
