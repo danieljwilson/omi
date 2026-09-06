@@ -15,6 +15,12 @@ LOG_MODULE_REGISTER(offline_rec, CONFIG_LOG_DEFAULT_LEVEL);
 #define EVICT_WATER_BYTES (460UL * 1024 * 1024) /* start deleting oldest files */
 #define EVICT_TARGET_BYTES (450UL * 1024 * 1024)
 #define EVICT_MAX_PER_PASS 4
+/* D01: the full MAX_AUDIO_FILES list (6,800 B) cannot live on the 4 KiB
+ * storage-thread stack. The file cache is sorted oldest-first, so a
+ * 16-entry window always holds the 16 oldest files, which is all one
+ * pass can consume; if none of them can be deleted the pass stalls and
+ * retries after HOUSEKEEP_INTERVAL_MS, exactly as it did before. */
+#define EVICT_LIST_WINDOW 16
 /* Also evict when the file count nears MAX_AUDIO_FILES — files beyond the
  * list cap would be invisible to the sync protocol. */
 #define EVICT_FILE_COUNT_WATER (MAX_AUDIO_FILES - 4)
@@ -292,11 +298,11 @@ void offline_rec_get_status(uint8_t out[OFFLINE_REC_STATUS_LEN])
 
 static void evict_oldest_files(void)
 {
-    char filenames[MAX_AUDIO_FILES][MAX_FILENAME_LEN];
-    uint32_t sizes[MAX_AUDIO_FILES];
+    static char filenames[EVICT_LIST_WINDOW][MAX_FILENAME_LEN];
+    static uint32_t sizes[EVICT_LIST_WINDOW];
     int count = 0;
 
-    if (get_audio_file_list_with_sizes(filenames, sizes, MAX_AUDIO_FILES, &count) < 0 || count <= 1) {
+    if (get_audio_file_list_with_sizes(filenames, sizes, EVICT_LIST_WINDOW, &count) < 0 || count <= 1) {
         return;
     }
 
