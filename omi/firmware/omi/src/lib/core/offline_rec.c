@@ -292,8 +292,8 @@ void offline_rec_get_status(uint8_t out[OFFLINE_REC_STATUS_LEN])
 
 static void evict_oldest_files(void)
 {
-    char filenames[MAX_AUDIO_FILES][MAX_FILENAME_LEN];
-    uint32_t sizes[MAX_AUDIO_FILES];
+    static char filenames[MAX_AUDIO_FILES][MAX_FILENAME_LEN];
+    static uint32_t sizes[MAX_AUDIO_FILES];
     int count = 0;
 
     if (get_audio_file_list_with_sizes(filenames, sizes, MAX_AUDIO_FILES, &count) < 0 || count <= 1) {
