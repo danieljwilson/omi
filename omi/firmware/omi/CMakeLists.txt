@@ -4,6 +4,11 @@ enable_language(C ASM) # OPUS
 
 project(omi)
 
+# Per-function stack usage (a .su file per translation unit) so the
+# storage-thread call chain can be measured instead of estimated; zero
+# runtime cost, no change to the generated code.
+zephyr_compile_options(-fstack-usage)
+
 file(GLOB app_sources
     src/main.c
     src/mic.c
