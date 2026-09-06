@@ -66,11 +66,57 @@ jobs:
       - name: Build firmware (offline-recording)
         working-directory: ncs
         run: |
+          # build.log feeds the RAM guard below and ships in the buildinfo
+          # artifact. The default `run` shell has no pipefail, so set it or a
+          # failed west build would be masked by tee's exit status.
+          set -o pipefail
           nrfutil toolchain-manager launch --ncs-version v2.9.0 -- \
             west build -b omi/nrf5340/cpuapp ${{ github.workspace }}/omi-repo/omi/firmware/omi \
               --sysbuild \
-              -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware
+              -- -DBOARD_ROOT=${{ github.workspace }}/omi-repo/omi/firmware \
+            2>&1 | tee build.log
         timeout-minutes: 15
+
+      - name: RAM guard (app-core Memory region table)
+        working-directory: ncs
+        run: |
+          # Sysbuild links four images (mcuboot, omi, b0n, ipc_radio) and each
+          # prints its own "Memory region" table; mcuboot's RAM region is also
+          # 440 KB, so the region size cannot identify the app core. Anchor on
+          # the post-link line that names build/omi/zephyr/zephyr.elf and take
+          # the RAM line that precedes it. pairent.10 sat at 98.35% (7,456 B
+          # headroom); 99% is the line that would have caught a +6,800 B fix.
+          python3 - build.log <<'EOF'
+          import os, re, sys
+          MULT = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3}
+          RAM = re.compile(r"^\s*RAM:\s+(\d+)\s+(B|KB|MB|GB)\s+(\d+)\s+(B|KB|MB|GB)\s+([\d.]+)%")
+          ANCHOR = re.compile(r"Generating files from \S*/build/omi/zephyr/zephyr\.elf\b")
+          last = None
+          with open(sys.argv[1], errors="replace") as f:
+              for line in f:
+                  m = RAM.match(line)
+                  if m:
+                      last = m
+                  elif ANCHOR.search(line):
+                      break
+              else:
+                  sys.exit("RAM guard: app-core post-link line (build/omi/zephyr/zephyr.elf) not found in build.log")
+          if last is None:
+              sys.exit("RAM guard: no RAM line precedes the app-core post-link line")
+          used = int(last[1]) * MULT[last[2]]
+          size = int(last[3]) * MULT[last[4]]
+          headroom = size - used
+          pct = 100.0 * used / size
+          ram_line = last.group(0).strip()
+          print(f"app-core {ram_line}")
+          print(f"app-core RAM used={used} B region={size} B headroom={headroom} B ({pct:.2f}%)")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write("## App-core RAM (build/omi)\n\n")
+              s.write("| used (B) | region (B) | headroom (B) | used |\n|---:|---:|---:|---:|\n")
+              s.write(f"| {used} | {size} | {headroom} | {pct:.2f}% |\n\n`{ram_line}`\n")
+          if pct > 99.0:
+              sys.exit(f"RAM guard: app-core RAM {pct:.2f}% exceeds 99% (headroom {headroom} B)")
+          EOF
 
       - name: Verify netcore config (ISSUES #92 wedge hardening)
         working-directory: ncs
@@ -119,4 +165,23 @@ jobs:
         with:
           name: omi-firmware-offline-recording
           path: ncs/dfu_out/
+          if-no-files-found: error
+
+      # Separate artifact so the DFU zip above keeps its exact shape (see the
+      # README-FLASH.txt sibling trick). App-core linker map + Kconfig + the
+      # -fstack-usage output + the captured build log: the inputs for comparing
+      # candidate builds by measurement. .config is a dotfile, hence
+      # include-hidden-files. No retention-days: this repo is public and 90
+      # days is already GitHub's maximum there; cut a Release for anything
+      # that must outlive that.
+      - name: Upload build info (map, .config, stack usage, build log)
+        uses: actions/upload-artifact@v7
+        with:
+          name: omi-firmware-buildinfo
+          path: |
+            ncs/build/omi/zephyr/zephyr.map
+            ncs/build/omi/zephyr/.config
+            ncs/build/**/*.su
+            ncs/build.log
+          include-hidden-files: true
           if-no-files-found: error
