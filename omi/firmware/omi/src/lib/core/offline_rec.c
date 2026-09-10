@@ -27,9 +27,16 @@ LOG_MODULE_REGISTER(offline_rec, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define HOUSEKEEP_INTERVAL_MS (30 * 1000)
 
-/* Default ON: the device's whole purpose is all-day capture; after a watchdog
- * reboot or battery swap it must resume without a button press. */
-static bool rec_enabled = true;
+/* Default OFF. This value is consulted ONLY when the settings partition holds
+ * no "pairent/rec_en" key at all, which is the state of a card that has never
+ * run Pairent firmware. Every other boot -- watchdog reset, battery swap, DFU
+ * -- restores the saved key through pairent_settings_set() before this matters,
+ * so the default is never reached on a configured unit and cannot resume
+ * anything. What it decides is the state a freshly flashed factory unit comes
+ * up in, and that unit must not be recording before anyone has asked it to
+ * (D17). Do not flip this back to true to make a unit resume after a reboot:
+ * resume reads the saved key, not this. */
+static bool rec_enabled = false;
 
 static uint8_t storage_state = OFFLINE_REC_STORAGE_OK;
 static uint64_t used_bytes_cached = 0;
